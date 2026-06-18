@@ -1,0 +1,7 @@
+*.a
+*.o
+*.dSYM/
+obj/
+*/obj/
+minilibx-linux/test/mlx-test
+mlx42/build/

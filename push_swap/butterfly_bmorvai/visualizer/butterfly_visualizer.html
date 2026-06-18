@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Butterfly Sort Visualizer</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d0d14;color:#e0e0f0;font-family:monospace;padding:16px;min-height:100vh}
+.wrap{max-width:900px;margin:0 auto}
+h1{text-align:center;font-size:15px;letter-spacing:6px;color:#7c6af7;margin-bottom:2px}
+.sub{text-align:center;font-size:10px;color:#444;letter-spacing:2px;margin-bottom:14px}
+.top{display:flex;gap:8px;margin-bottom:10px}
+.ic{display:flex;flex-direction:column;gap:5px;flex:1}
+.ic label{font-size:10px;color:#555;letter-spacing:1px;text-transform:uppercase}
+textarea{background:#111;border:1px solid #1e1e2e;color:#ccc;padding:6px 8px;font-family:monospace;font-size:10px;border-radius:4px;resize:vertical;min-height:52px;width:100%}
+.controls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+button{background:#111;color:#aaa;border:1px solid #2a2a3a;padding:5px 10px;font-family:monospace;font-size:11px;border-radius:3px;cursor:pointer}
+button:hover{background:#1a1a2a}
+.op-badge{font-size:15px;font-weight:700;color:#7c6af7;min-width:40px;letter-spacing:2px}
+.step-lbl{font-size:11px;color:#444}
+.stacks{display:flex;flex-direction:column;background:#0a0a12;border:1px solid #1a1a2a;border-radius:6px;padding:12px 8px;min-height:380px}
+.stack-title{font-size:10px;letter-spacing:3px;text-align:center;margin-bottom:4px;font-weight:500}
+.title-a{color:#7c6af7}.title-b{color:#f76a9a}
+.divider-h{height:1px;background:#1a1a2a;margin:8px 0}
+.row{display:flex;align-items:center;height:3px}
+.bar{height:3px;border-radius:2px;flex-shrink:0}
+.spacer{flex:1}
+.empty{color:#333;font-size:11px;text-align:center;padding:20px 0}
+.placeholder{display:flex;align-items:center;justify-content:center;flex:1;color:#333;font-size:12px;text-align:center;line-height:2;min-height:300px}
+input[type=range]{accent-color:#7c6af7;width:80px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BUTTERFLY SORT</h1>
+  <div class="sub">push_swap visualizer — bmorvai @ 42 wolfsburg</div>
+  <div class="top">
+    <div class="ic" style="flex:0.6">
+      <label>numbers</label>
+      <textarea id="nums">9 3 7 1 8 2 6 4 5 10 15 11 14 12 13</textarea>
+    </div>
+    <div class="ic" style="flex:1.4">
+      <label>operations — paste ./push_swap output</label>
+      <textarea id="ops" placeholder="pb&#10;ra&#10;rb&#10;pa&#10;..."></textarea>
+    </div>
+  </div>
+  <div class="controls">
+    <button onclick="build()">build</button>
+    <button onclick="goStart()">⏮</button>
+    <button onclick="stepBack()">◀</button>
+    <button id="playBtn" onclick="togglePlay()">▶ play</button>
+    <button onclick="stepForward()">▶</button>
+    <button onclick="goEnd()">⏭</button>
+    <input type="range" id="speed" min="20" max="800" value="120" step="1">
+    <span class="step-lbl" id="stepLbl">—</span>
+    <span class="op-badge" id="opBadge"></span>
+  </div>
+  <div class="stacks" id="stacks">
+    <div class="placeholder">enter numbers → paste operations → click build</div>
+  </div>
+</div>
+<script>
+const OPS=["sa","sb","ss","pa","pb","ra","rb","rr","rra","rrb","rrr"];
+let states=null,step=0,playing=false,timer=null;
+
+function rainbow(idx,max){
+  if(max===0)return[270,75,58];
+  return[Math.round(270-(idx/max)*270),75,58];
+}
+
+function applyOp(a,b,op){
+  a=[...a];b=[...b];
+  if(op==="sa"&&a.length>=2){let t=a[0];a[0]=a[1];a[1]=t;}
+  else if(op==="sb"&&b.length>=2){let t=b[0];b[0]=b[1];b[1]=t;}
+  else if(op==="ss"){if(a.length>=2){let t=a[0];a[0]=a[1];a[1]=t;}if(b.length>=2){let t=b[0];b[0]=b[1];b[1]=t;}}
+  else if(op==="pa"&&b.length)a.unshift(b.shift());
+  else if(op==="pb"&&a.length)b.unshift(a.shift());
+  else if(op==="ra"&&a.length)a.push(a.shift());
+  else if(op==="rb"&&b.length)b.push(b.shift());
+  else if(op==="rr"){if(a.length)a.push(a.shift());if(b.length)b.push(b.shift());}
+  else if(op==="rra"&&a.length)a.unshift(a.pop());
+  else if(op==="rrb"&&b.length)b.unshift(b.pop());
+  else if(op==="rrr"){if(a.length)a.unshift(a.pop());if(b.length)b.unshift(b.pop());}
+  return[a,b];
+}
+
+function build(){
+  const raw=document.getElementById("nums").value.trim().split(/\s+/).map(Number).filter(n=>!isNaN(n));
+  if(!raw.length)return;
+  const sorted=[...raw].sort((a,b)=>a-b);
+  const init=raw.map(v=>({value:v,index:sorted.indexOf(v)}));
+  const ops=document.getElementById("ops").value.split("\n").map(s=>s.trim()).filter(s=>OPS.includes(s));
+  states=[{a:[...init],b:[],op:null}];
+  let a=[...init],b=[];
+  for(const op of ops){[a,b]=applyOp(a,b,op);states.push({a:[...a],b:[...b],op});}
+  step=0;setPlaying(false);render();
+}
+
+function renderStack(nodes,maxIdx,maxVal){
+  if(!nodes.length)return'<div class="empty">empty</div>';
+  return nodes.map(n=>{
+    const w=Math.max(2,Math.round((n.value/maxVal)*100));
+    const [h,s,l]=rainbow(n.index,maxIdx);
+    const grad=`linear-gradient(to right, hsla(${h},${s}%,${l}%,0.15) 0%, hsl(${h},${s}%,${l}%) 50%, hsla(${h},${s}%,${l}%,0.15) 100%)`;
+    return`<div class="row"><div class="spacer"></div><div class="bar" style="width:${w}%;background:${grad}"></div><div class="spacer"></div></div>`;
+  }).join('');
+}
+
+function render(){
+  if(!states)return;
+  const cur=states[step];
+  const maxIdx=Math.max(...states[0].a.map(n=>n.index),1);
+  const maxVal=Math.max(...states[0].a.map(n=>n.value),1);
+  document.getElementById("stacks").innerHTML=`
+    <div class="stack-title title-a">stack a (${cur.a.length})</div>
+    <div>${renderStack(cur.a,maxIdx,maxVal)}</div>
+    <div class="divider-h"></div>
+    <div class="stack-title title-b">stack b (${cur.b.length})</div>
+    <div>${renderStack(cur.b,maxIdx,maxVal)}</div>`;
+  document.getElementById("stepLbl").textContent=`${step} / ${states.length-1}`;
+  document.getElementById("opBadge").textContent=cur.op||'';
+}
+
+function goStart(){step=0;setPlaying(false);render();}
+function goEnd(){if(states){step=states.length-1;setPlaying(false);render();}}
+function stepBack(){if(step>0){step--;render();}}
+function stepForward(){if(states&&step<states.length-1){step++;render();}}
+function setPlaying(val){
+  playing=val;clearInterval(timer);
+  document.getElementById("playBtn").textContent=playing?'⏸ pause':'▶ play';
+  if(playing){
+    const spd=820-Number(document.getElementById("speed").value);
+    timer=setInterval(()=>{
+      if(!states||step>=states.length-1){setPlaying(false);return;}
+      step++;render();
+    },spd);
+  }
+}
+function togglePlay(){if(!states)return;setPlaying(!playing);}
+</script>
+</body>
+</html>

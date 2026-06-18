@@ -1,0 +1,7 @@
+*.o
+*.a
+*/so_long
+*/bonus
+*/objs/
+*/objs_bonus/
+*/mlx/build/

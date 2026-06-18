@@ -1,0 +1,5236 @@
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game.c                                             :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:52:17 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 14:32:42 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+/// Given the viewing plane width and FOV
+/// calculates remaining camera parameters
+void	game_calc_camera_params(t_game *game)
+{
+	game->fstop = game->cam_width / (tan(game->fov / 2) * 2);
+	game->cam_height = (float)game->disp.height / game->disp.width
+		* game->cam_width;
+}
+
+void	game_update_objects(t_game *game)
+{
+	int		i;
+	t_pt	objpos;
+	t_pt	pos;
+
+	pos = vec_from_vec3(&game->pos);
+	i = -1;
+	pos = vec(game->pos.x, game->pos.y);
+	while (++i < MAX_OBJECTS)
+	{
+		objpos = vec_from_vec3(&game->objects[i].pos);
+		if (game->objects[i].type == OBJ_PHONEBOX)
+			game_update_phonebox(game, &i);
+		if (game->objects[i].type == OBJ_PILL)
+			game_update_pill(game, objpos, pos, &i);
+		else if (game->objects[i].type == OBJ_BULLET)
+			game_update_bullet(game, &i);
+		else if (game->objects[i].type == OBJ_AGENT && game->matrix_mode)
+			game_update_matrix_agent(game, objpos, pos, &i);
+		else if (game->objects[i].type == OBJ_DOOR)
+			game_update_door_object(game, &i);
+	}
+}
+
+/// Update game logic for next frame
+void	game_update(t_game *game)
+{
+	game_update_physics(game);
+	game_update_objects(game);
+	game_update_walk(game);
+	game_update_move(game);
+	game_update_matrix(game);
+}
+
+/// Given the x coordinate on the image plane, return the 2D ray for that column
+t_line	game_ray_cast(t_game *game, float f)
+{
+	const float	angle = atan((-(-1 + 2 * f) * game->cam_width / 2) \
+				/ game->fstop);
+	t_line		ray;
+	t_vec		perp;
+
+	ray.dir = vec(-sin(game->rot + angle), -cos(game->rot + angle));
+	ray.loc = vec_from_vec3(&game->pos);
+	perp = vec_rotate(ray.dir, M_PI / 2);
+	ray.loc = vec_add(ray.loc, vec_scale(perp, game->cam_width / 2 * (-1 + 2
+					* f)));
+	return (ray);
+}
+
+int	game_loop(t_game *game)
+{
+	struct timeval	then;
+	struct timeval	now;
+
+	if (game->state == S_PAUSED)
+		return (0);
+	gettimeofday(&then, NULL);
+	if (game->state == S_RUNNING || game->state == S_INTRO)
+		game->ticks++;
+	game_draw(game);
+	if (game->state == S_RUNNING)
+		game_update(game);
+	if (game->state == S_PAUSING)
+		game->state = S_PAUSED;
+	gettimeofday(&now, NULL);
+	game_framectrl(game, &now, &then);
+	return (0);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_actions.c                                     :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 18:21:09 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 14:33:03 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	game_shoot(t_game *game)
+{
+	t_obj	bullet;
+	t_vec	spd;
+
+	bullet.type = OBJ_BULLET;
+	bullet.pos = game->pos;
+	bullet.pos.z += CAM_HEIGHT;
+	bullet.normal = vec_rotate(vec(0, -1), game->rot);
+	bullet.width = .1;
+	bullet.height = .1;
+	spd = vec_scale(vec_rotate(vec(0, -1), -game->rot), 1);
+	bullet.pos.x += spd.x;
+	bullet.pos.y += spd.y;
+	bullet.u_obj.bullet.speed = vec3_from_vec(&spd);
+	bullet.u_obj.bullet.speed.z = tan(game->rotx);
+	game_obj_add(game, &bullet);
+}
+
+void	game_setblock(t_game *game)
+{
+	t_line		ray;
+	t_hitrec	res;
+
+	ray.dir = vec_rotate(vec(0, -1), -game->rot);
+	ray.loc = vec_from_vec3(&game->pos);
+	res = map_ray_intersect(&game->map, &ray);
+	map_set(&game->map, (int) res.hit.x - (res.normal.x < 0),
+		(int) res.hit.y - (res.normal.y < 0), '1');
+}
+
+void	game_unsetblock(t_game *game)
+{
+	t_line		ray;
+	t_hitrec	res;
+
+	ray.dir = vec_rotate(vec(0, -1), -game->rot);
+	ray.loc = vec(game->pos.x, game->pos.y);
+	res = map_ray_intersect(&game->map, &ray);
+	map_set(&game->map, (int) res.hit.x - (res.normal.x > 0),
+		(int) res.hit.y - (res.normal.y > 0), '0');
+}
+
+void	game_interact(t_game *game)
+{
+	t_line		ray;
+	int			i;
+	t_hitrec	h;
+	t_door		*d;
+
+	ray.dir = vec_rotate(vec(0, -1), -game->rot);
+	ray.loc = vec_from_vec3(&game->pos);
+	i = -1;
+	while (++i < MAX_OBJECTS)
+	{
+		if (game->objects[i].type == OBJ_NONE)
+			continue ;
+		h = game_obj_intersect(game, &game->objects[i], &ray);
+		if (h.obj && h.obj->type == OBJ_DOOR)
+		{
+			d = &h.obj->u_obj.door;
+			if (d->state == D_CLOSED)
+				d->state = D_OPENING;
+			if (d->state == D_OPEN)
+				d->state = D_CLOSING;
+		}
+	}
+}
+
+void	game_pause_toggle(t_game *game)
+{
+	if (game->state == S_PAUSED)
+	{
+		game_mouse_trap(game);
+		game->state = S_RUNNING;
+	}
+	else if (game->state == S_RUNNING)
+	{
+		game_mouse_release(game);
+		game->state = S_PAUSING;
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_deinit.c                                      :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:49:46 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 13:35:52 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <mlx.h>
+#include <pthread.h>
+
+void	game_deinit_textures(t_game *game)
+{
+	int	i;
+
+	i = 0;
+	while (i < TXTMAX + 1 + game->map.txtcount - 4)
+	{
+		img_deinit(&game->textures[i], game->disp.mlx);
+		i++;
+	}
+	free(game->textures);
+}
+
+/// Deinitialize game
+void	game_deinit(t_game *game)
+{
+	mlx_do_key_autorepeaton(game->disp.mlx);
+	if (game->map.height > 0)
+		map_deinit(&game->map);
+	img_deinit(&game->mattex, game->disp.mlx);
+	game_deinit_textures(game);
+	free(game->hit_buffer);
+	free(game->mt.data);
+	pthread_mutex_destroy(&game->mutex_render);
+	display_deinit(&game->disp);
+}
+
+int	game_handle_close(void *param)
+{
+	(void)param;
+	exit(0);
+	return (0);
+}
+
+void	game_setup_window_close_handler(void *win_ptr)
+{
+	mlx_hook(win_ptr, 17, 0, game_handle_close, NULL);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_draw.c                                        :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 14:43:43 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 14:08:07 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <pthread.h>
+
+void	game_render_multi(t_game *game)
+{
+	int		i;
+
+	game->next_col = 0;
+	i = -1;
+	while (++i < THREADS)
+	{
+		game->threadinfos[i] = (t_threadinfo){game, i};
+		pthread_create(&game->threads[i], NULL, game_render_thread,
+			(void *)&game->threadinfos[i]);
+	}
+	i = -1;
+	while (++i < THREADS)
+		pthread_join(game->threads[i], NULL);
+}
+
+void	game_render(t_game *game)
+{
+	int		x;
+
+	x = 0;
+	while (x < game->disp.width)
+	{
+		game_render_col(game, x, game->upscale);
+		x += game->upscale;
+	}
+}
+
+void	game_draw(t_game *game)
+{
+	if (game->state == S_INTRO)
+		game_draw_intro(game);
+	else
+		game_draw_frame(game);
+	display_update(&game->disp);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_draw_frame.c                                  :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 15:53:27 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 13:55:51 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	game_draw_crosshairs(t_game *game)
+{
+	int const	cw = game->disp.width / 2;
+	int const	ch = game->disp.height / 2;
+	int const	stroke = fmax(game->disp.height / 500.0, 1);
+	int const	size = game->disp.height / 50;
+
+	img_draw_rect(&game->disp.buffer, ipt(cw - stroke / 2, ch - size),
+		ipt(cw + stroke / 2, ch - size / 4), CGREEN);
+	img_draw_rect(&game->disp.buffer, ipt(cw - stroke / 2, ch + size / 4),
+		ipt(cw + stroke / 2, ch + size), CGREEN);
+	img_draw_rect(&game->disp.buffer, ipt(cw - size, ch - stroke / 2),
+		ipt(cw - size / 4, ch + stroke / 2), CGREEN);
+	img_draw_rect(&game->disp.buffer, ipt(cw + size / 4, ch - stroke / 2),
+		ipt(cw + size, ch + stroke / 2), CGREEN);
+}
+
+void	game_draw_intro(t_game *game)
+{
+	char **const	intro = game->map.intro_phrases;
+	const int		delay = 10;
+	unsigned int	pos;
+	unsigned int	i;
+	t_textinfo		t;
+
+	pos = game->ticks / 6;
+	i = -1;
+	while (intro[++i] && pos >= ft_strlen(intro[i]) + delay)
+		pos -= ft_strlen(intro[i]) + delay;
+	if (intro[i] && pos > ft_strlen(intro[i]) && \
+			pos < ft_strlen(intro[i]) + delay)
+		pos = ft_strlen(intro[i]);
+	else if (!intro[i] || pos >= ft_strlen(intro[i]) + delay)
+	{
+		game->state = S_RUNNING;
+		return ;
+	}
+	img_draw_rect(&game->disp.buffer, ipt(0, 0), ipt(game->disp.width,
+			game->disp.height), CINTROBG);
+	t = (t_textinfo){intro[i], CGREEN, pos, true};
+	img_put_text_extra(&game->disp.buffer, &game->textures[TXTFONT],
+		ipt(game->disp.width / 2 - (ft_strlen(intro[i]) * 15) / 2,
+			game->disp.height / 2 - 15 / 2), &t);
+}
+
+void	game_draw_overlay_debug(t_game *game)
+{
+	char	t[30];
+	char	*s;
+
+	ft_strlcpy(t, "FPS: ", 30);
+	s = ft_itoa(game->fps);
+	ft_strlcat(t, s, 30);
+	img_put_text(&game->disp.buffer, &game->textures[TXTFONT], ipt(10, 10),
+		t);
+	free(s);
+	s = ft_itoa(game->rot / DEG);
+	ft_strlcpy(t, "rot.: ", 30);
+	ft_strlcat(t, s, 30);
+	free(s);
+	img_put_text(&game->disp.buffer, &game->textures[TXTFONT], ipt(10, 40),
+		t);
+	s = str_direction(angle_direction(game->rot));
+	img_put_text(&game->disp.buffer, &game->textures[TXTFONT], ipt(10, 70),
+		s);
+	free(s);
+}
+
+void	game_draw_overlay_matrix(t_game *game)
+{
+	t_ipt	tl;
+	t_ipt	br;
+
+	img_put_img(&game->disp.buffer, &game->textures[TXTGUN],
+		game->disp.width - game->textures[TXTGUN].width
+		* game->textures[TXTGUN].scale, game->disp.height
+		- game->textures[TXTGUN].height * game->textures[TXTGUN].scale);
+	tl = ipt(0, game->disp.height - (float)game->disp.height / 200);
+	br = ipt(game->disp.width * game->health / 75.0, game->disp.height);
+	img_draw_rect(&game->disp.buffer, tl, br,
+		col_mix(CRED, CGREEN, game->damage_taken));
+	game->damage_taken = 0;
+}
+
+void	game_draw_frame(t_game *game)
+{
+	if (THREADS > 1)
+		game_render_multi(game);
+	else
+		game_render(game);
+	if (game->show_minimap)
+		game_draw_minimap_direction(game);
+	if (game->matrix_mode)
+		game_draw_overlay_matrix(game);
+	if (game->show_debug)
+		game_draw_overlay_debug(game);
+	game_draw_crosshairs(game);
+	if (game->state == S_PAUSING || game->state == S_PAUSED)
+		game_draw_overlay_txt(game, "PAUSED (p to unpause)");
+	if (game->state == S_OVER)
+		game_draw_overlay_txt(game, "GAME OVER");
+	if (game->state == S_WON)
+		game_draw_overlay_txt(game, "You won! (Esc to exit)");
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_draw_overlays.c                               :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 15:56:52 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 13:55:32 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	game_draw_overlay_txt(t_game *game, char *msg)
+{
+	float	w;
+	float	h;
+	float	margin;
+	t_ipt	tl;
+	t_ipt	br;
+
+	w = (ft_strlen(msg) + 2) * 15;
+	h = 30;
+	margin = .15 * w;
+	tl = ipt(game->disp.width / 2 - w / 2 - margin, game->disp.height / 2
+			- h / 2 - margin);
+	br = ipt(game->disp.width / 2 + w / 2 + margin, game->disp.height / 2
+			+ h / 2 + margin);
+	img_draw_rect(&game->disp.buffer, tl, br, CRED);
+	img_put_text_center(&game->disp.buffer, &game->textures[TXTFONT],
+		ipt(game->disp.width / 2, game->disp.height / 2), msg);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_floor.c                                       :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 14:44:57 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 14:46:06 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+t_color	game_render_ceil(t_game *game, int bufpos, t_pt campos,
+		float fstop_diag)
+{
+	float		dist;
+	t_vec		offset;
+	t_pt		hitpos;
+	t_color		col;
+	double		ign;
+
+	col = CTRANSPARENT;
+	dist = fabs(fstop_diag / (campos.y + game->cam_height
+				* tan(game->rotx))) * (game->pos.z + CAM_HEIGHT - 1);
+	offset = vec_scale(vec_normalize(game->hit_buffer[bufpos].ray.dir),
+			dist);
+	hitpos = vec_add(offset, vec_from_vec3(&game->pos));
+	if (map_get(&game->map, hitpos.x, hitpos.y) == '1')
+	{
+		if (FLOOR_TEXTURE)
+		{
+			col = img_getpxlr(&game->textures[TXTFLOOR],
+					modf(hitpos.x, &ign), modf(hitpos.y, &ign));
+			col = col_lum(col, 0.8);
+		}
+		else
+			col = game->map.floor;
+	}
+	return (col);
+}
+
+t_color	game_render_floor_ceil(t_game *game, int bufpos, float z,
+		t_vec diag_camy)
+{
+	t_color		col;
+	float		dist;
+	t_vec		offset;
+	t_pt		hitpos;
+	double		i;
+
+	col = game->map.ceiling;
+	if (z < 0)
+	{
+		col = game->map.floor;
+		if (FLOOR_TEXTURE)
+		{
+			dist = fabs(diag_camy.x / (diag_camy.y + game->cam_height
+						* tan(game->rotx))) * (CAM_HEIGHT + game->pos.z);
+			offset = vec_scale(vec_normalize(game->hit_buffer[bufpos].ray.dir),
+					dist);
+			hitpos = vec_add(offset, vec_from_vec3(&game->pos));
+			if (map_get(&game->map, hitpos.x, hitpos.y))
+				col = col_fade(img_getpxlr(&game->textures[TXTFLOOR],
+							modf(hitpos.x, &i), modf(hitpos.y, &i)), dist);
+		}
+	}
+	return (col);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_hooks.c                                       :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/13 15:07:21 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 15:08:15 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	game_expose(t_game *game)
+{
+	game_draw(game);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_init.c                                        :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:49:46 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 15:09:31 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <mlx.h>
+#include <pthread.h>
+
+void	game_map_add_planes(t_game *game)
+{
+	int		i;
+	t_obj	*o;
+
+	i = 0;
+	while (i < game->map.objcount)
+	{
+		o = &game->map.obj[i];
+		if (o->width == 0)
+			o->width = o->height * ((float)game->textures[TXTMAX + 1
+					+ o->texture_id].width / game->textures[TXTMAX + 1
+					+ o->texture_id].height);
+		if (o->height == 0)
+			o->height = o->width * ((float)game->textures[TXTMAX + 1
+					+ o->texture_id].height / game->textures[TXTMAX + 1
+					+ o->texture_id].width);
+		game_obj_add(game, &game->map.obj[i]);
+		i++;
+	}
+}
+
+/*
+void	game_init_logic(t_game *game)
+{
+	game->pos = vec3(game->map.spawn_x + .5, game->map.spawn_y + .5, 0);
+	game->mz = 0;
+	game->rot = rot_fromchar(game->map.direction);
+	ft_bzero(&game->input_state, 64);
+	game->ticks = 0;
+	game->health = 75;
+	game->matrix_mode = MATTEX;
+	game->matrix_mode_mix = 0;
+	game->show_minimap = 1;
+	game->physics = 1;
+	game->show_debug = 1;
+
+	game->damage_taken = 0;
+	game->state = S_INTRO;
+
+	game_map_add_objects(game);
+	game_map_add_planes(game);
+}
+
+void	game_init_camera(t_game *game)
+{
+	size_t	hl_size;
+	size_t	hl_num;
+
+	game->last_draw.tv_sec = 0;
+	game->last_draw.tv_usec = 0;
+	game->fov = M_PI / 2;
+	game->rotx = 0;
+	game->upscale = GAME_UPSCALE;
+	game->cam_width = CAM_WIDTH;
+	game_calc_camera_params(game);
+	game_mouse_trap(game);
+	hl_size = sizeof(t_column_data);
+	hl_num = ceil(game->disp.width / (float) game->upscale);
+	game->hit_buffer = malloc(hl_size * hl_num);
+}
+
+
+/// Load all game textures
+int	game_init_textures(t_game *game)
+{
+	int		i;
+	char	*txt;
+	int		a;
+
+	game->textures = \
+			ft_xmalloc(sizeof(t_img) * ((TXTMAX + 1) + game->map.txtcount - 4));
+	img_load(&game->textures[TXTDOOR], game->disp.mlx, "assets/door.xpm");
+	img_load(&game->textures[TXTAGENT0], game->disp.mlx, "assets/smith0.xpm");
+	img_load(&game->textures[TXTAGENT1], game->disp.mlx, "assets/smith1.xpm");
+	img_load(&game->textures[TXTAGENT2], game->disp.mlx, "assets/smith2.xpm");
+	img_load(&game->textures[TXTPILL], game->disp.mlx, "assets/pill.xpm");
+	img_load(&game->textures[TXTDOOR], game->disp.mlx, "assets/door.xpm");
+	img_load(&game->textures[TXTPHONEBOX0], \
+		game->disp.mlx, "assets/phonebox.xpm");
+	img_load(&game->textures[TXTPHONEBOX1], \
+		game->disp.mlx, "assets/phonebox2.xpm");
+	img_load(&game->textures[TXTPOINT], game->disp.mlx, "assets/point.xpm");
+	img_load(&game->textures[TXTGUN], game->disp.mlx, "assets/gun20.xpm");
+	game->textures[TXTGUN].scale = 0.8;
+	img_load(&game->textures[TXTBOX], game->disp.mlx, "assets/box.xpm");
+	img_load(&game->textures[TXTFONT], game->disp.mlx, "assets/font.xpm");
+	img_load(&game->textures[TXTBULLET], game->disp.mlx, "assets/bullet.xpm");
+	img_load(&game->textures[TXTFLOOR], game->disp.mlx, "textures/wood.xpm");
+	img_init(&game->minimap, game->disp.mlx, 500, 500);
+	img_init(&game->mattex, game->disp.mlx, MATTEX_SIZE, MATTEX_SIZE);
+	if (mattex_init(&game->mt) != OK)
+		return (ERR);
+	i = 0;
+	while (i < game->map.txtcount)
+	{
+		txt = game->map.map_textures[i];
+		a = TXTMAX + i - 3;
+		if (i < 4)
+			a = i;
+		img_load(&game->textures[a], game->disp.mlx, txt);
+		i++;
+	}
+	mattex_draw(&game->mt, game, &game->mattex);
+	return (OK);
+}
+*/
+
+void	game_txt_load(t_game *game, int txtid, char *path)
+{
+	if (!img_load(&game->textures[txtid], game->disp.mlx, path))
+	{
+		game_deinit(game);
+		errexit("Loading image failed\n");
+	}
+}
+
+/// Set up mlx event hooks
+void	game_init_hooks(t_game *game)
+{
+	mlx_hook(game->disp.win, KeyPress, KeyPressMask, game_keydown, game);
+	mlx_hook(game->disp.win, KeyRelease, KeyReleaseMask, game_keyup, game);
+	mlx_hook(game->disp.win, ButtonPress, ButtonPressMask, game_mousedown,
+		game);
+	mlx_expose_hook(game->disp.win, (int (*)(void *))game_expose, game);
+	mlx_loop_hook(game->disp.mlx, (int (*)(void *))game_loop, game);
+}
+
+/// Initialize new map - this needs to be called on map switch
+void	game_init_map(t_game *game, char *map_path)
+{
+	ft_bzero(&game->map, sizeof(t_map));
+	ft_bzero(&game->objects, MAX_OBJECTS * sizeof(t_obj));
+	map_init_values(&game->map);
+	map_read(&game->map, map_path);
+	game_init_textures(game);
+	game_init_logic(game);
+}
+
+/// Initialize and run game
+void	game_init(t_game *game, char *map_path, int w, int h)
+{
+	ft_bzero(game, sizeof(t_game));
+	display_init(&game->disp, w, h);
+	game_init_hooks(game);
+	game->minimap_rect = rect(MINIMAP_TLX, MINIMAP_TLY,
+			MINIMAP_BRX, MINIMAP_BRY);
+	game->minimap_center = ipt(
+			(game->minimap_rect.br.x + game->minimap_rect.tl.x) / 2,
+			(game->minimap_rect.br.y + game->minimap_rect.tl.y) / 2);
+	mattex_init(&game->mt);
+	game_init_map(game, map_path);
+	img_init(&game->mattex, game->disp.mlx, MATTEX_SIZE, MATTEX_SIZE);
+	mattex_draw(&game->mt, game, &game->mattex);
+	game_init_camera(game);
+	pthread_mutex_init(&game->mutex_render, NULL);
+	game_setup_window_close_handler(game->disp.win);
+	mlx_loop(game->disp.mlx);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_init_textures.c                               :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 16:15:32 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 14:49:13 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <mlx.h>
+
+void	game_obj_new(t_game *game, t_objtype type, t_vec3 *pos)
+{
+	t_obj	nobj;
+
+	nobj.type = type;
+	nobj.pos = *pos;
+	if (type == OBJ_AGENT)
+	{
+		nobj.width = .5 * .8;
+		nobj.height = .8;
+		nobj.u_obj.enemy.hit_points = 100;
+	}
+	else if (type == OBJ_PHONEBOX)
+	{
+		nobj.width = .5;
+		nobj.height = 1;
+	}
+	else if (type == OBJ_PILL)
+	{
+		nobj.width = .25;
+		nobj.height = .1;
+		nobj.normal = vec(1, 0);
+	}
+	else if (type == OBJ_DOOR)
+		game_obj_door_init(game, &nobj, pos);
+	game_obj_add(game, &nobj);
+}
+
+void	game_obj_door_init(t_game *game, t_obj *nobj, t_vec3 *pos)
+{
+	nobj->width = 1;
+	nobj->height = 1;
+	if (map_get(&game->map, pos->x + 1, pos->y) == '1'
+		&& map_get(&game->map, pos->x - 1, pos->y) == '1')
+		nobj->normal = vec(0, 1);
+	else
+		nobj->normal = vec(1, 0.001);
+	nobj->texture_id = 4;
+	nobj->u_obj.door.open = 0;
+	nobj->u_obj.door.state = D_CLOSED;
+}
+
+/// Load all game textures
+int	game_init_textures(t_game *game)
+{
+	int		i;
+	char	*txt;
+	int		a;
+
+	game->textures = ft_xmalloc(sizeof(t_img) * (TXTMAX + 1
+				+ game->map.txtcount - 4));
+	game_init_img_textures(game);
+	i = -1;
+	while (++i < game->map.txtcount)
+	{
+		txt = game->map.map_textures[i];
+		a = TXTMAX + 1 + i - 4;
+		if (i < 4)
+			a = i;
+		if (access(txt, F_OK) != 0)
+		{
+			ft_putstr_fd(txt, STDERR_FILENO);
+			game_deinit(game);
+			errexit(": Texture file not accessible\n");
+		}
+		img_load(&game->textures[a], game->disp.mlx, txt);
+	}
+	return (OK);
+}
+
+void	game_init_img_textures(t_game *game)
+{
+	game_txt_load(game, TXTDOOR, "assets/door.xpm");
+	game_txt_load(game, TXTAGENT0, "assets/smith0.xpm");
+	game_txt_load(game, TXTAGENT1, "assets/smith1.xpm");
+	game_txt_load(game, TXTAGENT2, "assets/smith2.xpm");
+	game_txt_load(game, TXTPILL, "assets/pill.xpm");
+	game_txt_load(game, TXTPHONEBOX0, "assets/phonebox.xpm");
+	game_txt_load(game, TXTPHONEBOX1, "assets/phonebox2.xpm");
+	game_txt_load(game, TXTPOINT, "assets/point.xpm");
+	game_txt_load(game, TXTGUN, "assets/gun20.xpm");
+	game->textures[TXTGUN].scale = 0.8;
+	game_txt_load(game, TXTBOX, "assets/box.xpm");
+	game_txt_load(game, TXTFONT, "assets/font.xpm");
+	game_txt_load(game, TXTBULLET, "assets/bullet.xpm");
+	game_txt_load(game, TXTFLOOR, "textures/wood.xpm");
+}
+
+void	game_map_add_objects(t_game *game)
+{
+	t_vec3		pos;
+	t_objtype	type;
+	int			x;
+	int			y;
+
+	x = 0;
+	while (x < game->map.width)
+	{
+		y = 0;
+		while (y < game->map.height)
+		{
+			pos = vec3(x + .5, y + .5, 0);
+			type = map_char_to_objtype(map_get(&game->map, x, y));
+			if (type != OBJ_NONE)
+			{
+				game_obj_new(game, type, &pos);
+				map_set(&game->map, x, y, '0');
+			}
+			y++;
+		}
+		x++;
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_init_utils.c                                  :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 18:17:08 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 14:33:16 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <mlx.h>
+
+void	game_obj_print(t_obj *obj)
+{
+	printf("game object: \n");
+	printf("pos: %.2f %.2f %.2f\n", obj->pos.x, obj->pos.y, obj->pos.z);
+	printf("dim: %.2fx%.2f\n", obj->width, obj->height);
+	printf("normal: %.2fx%.2f\n", obj->normal.x, obj->normal.y);
+	printf("txtID: %i\n", obj->texture_id);
+}
+
+void	game_init_logic(t_game *game)
+{
+	game->pos = vec3(game->map.spawn_x + .5, game->map.spawn_y + .5, 0);
+	game->mz = 0;
+	game->rot = rot_fromchar(game->map.direction);
+	ft_bzero(&game->input_state, 64);
+	game->ticks = 0;
+	game->health = 75;
+	game->matrix_mode = MATTEX;
+	game->matrix_mode_mix = 0;
+	game->show_minimap = 1;
+	game->physics = 1;
+	game->show_debug = 1;
+	game->damage_taken = 0;
+	game->state = S_INTRO;
+	game_map_add_objects(game);
+	game_map_add_planes(game);
+}
+
+void	game_init_camera(t_game *game)
+{
+	size_t	hl_size;
+	size_t	hl_num;
+
+	game->last_draw.tv_sec = 0;
+	game->last_draw.tv_usec = 0;
+	game->fov = M_PI / 2;
+	game->rotx = 0;
+	game->upscale = GAME_UPSCALE;
+	game->cam_width = CAM_WIDTH;
+	game_calc_camera_params(game);
+	game_mouse_trap(game);
+	hl_size = sizeof(t_column_data);
+	hl_num = ceil(game->disp.width / (float)game->upscale);
+	game->hit_buffer = ft_xmalloc(hl_size * hl_num);
+}
+
+t_objtype	map_char_to_objtype(char objchar)
+{
+	if (objchar == 'A')
+		return (OBJ_AGENT);
+	else if (objchar == 'P')
+		return (OBJ_PHONEBOX);
+	else if (objchar == 'R')
+		return (OBJ_PILL);
+	else if (objchar == 'D')
+		return (OBJ_DOOR);
+	return (OBJ_NONE);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_input.c                                       :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:51:57 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 13:59:28 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include "vector.h"
+
+int	game_mousedown(int key, int x, int y, t_game *game)
+{
+	(void) x, (void) y;
+	if (key == Button1)
+	{
+		if (game->matrix_mode)
+			game_shoot(game);
+		else
+			game_unsetblock(game);
+	}
+	else if (key == Button2)
+		return (0);
+	else if (key == Button3)
+		game_setblock(game);
+	else if (key == Button4)
+	{
+		game->fov *= 1.1;
+		game_calc_camera_params(game);
+	}
+	else if (key == Button5)
+	{
+		game->fov *= .9;
+		game_calc_camera_params(game);
+	}
+	return (0);
+}
+
+void	game_keydown_controls(t_game *game, int key)
+{
+	if (key == KEY_MINIMAP)
+		game->show_minimap = !game->show_minimap;
+	if (key == KEY_DEBUG)
+		game->show_debug = !game->show_debug;
+	if (key == KEY_MATRIXMODE)
+		game->matrix_mode = !game->matrix_mode;
+	if (key == KEY_PAUSE)
+		game_pause_toggle(game);
+	if (key == KEY_PHYSICS)
+		game->physics = !game->physics;
+	if (key == XK_1)
+		game->textures[TXTBOX].scale += 0.1;
+	if (key == XK_2)
+		game->textures[TXTBOX].scale -= 0.1;
+	if (key == KEY_INTERACT)
+		game_interact(game);
+	// game->fov = fclamp(game->fov, (float) 5 / 180 * M_PI,
+	// 		(float) 170 / 180 * M_PI);
+	// game_calc_camera_params(game);
+	if (key == KEY_EXIT1 || key == KEY_EXIT2)
+		mlx_loop_end(game->disp.mlx);
+}
+
+int	game_keydown(int key, t_game *game)
+{
+	if (game->state == S_INTRO)
+		game->state = S_RUNNING;
+	game_set_key(game, key, 1);
+	game_keydown_controls(game, key);
+	return (0);
+}
+
+int	game_keyup(int key, t_game *game)
+{
+	game_set_key(game, key, 0);
+	return (0);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_minimap.c                                     :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 14:34:16 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 12:18:47 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+t_pt	minimap_to_world(t_game *game, t_pt loc)
+{
+	return (vec_add(vec_from_vec3(&game->pos),
+			vec_rotate(vec_scale(loc, MINIMAP_SCALE), -game->rot + M_PI)));
+}
+
+float	ipt_dist(t_ipt a, t_ipt b)
+{
+	return (hypot(a.x - b.x, a.y - b.y));
+}
+
+t_color	game_render_minimap_pxl(t_game *game, int x, int y)
+{
+	const t_pt	ct_offset = vec(game->minimap_center.x - \
+			x, game->minimap_center.y - y);
+	const t_ipt	pxlhere = ipt(x, y);
+	t_pt		here;
+	double		a;
+
+	if (ipt_dist(game->minimap_center, pxlhere) < 10)
+		return (CGREEN);
+	here = minimap_to_world(game, ct_offset);
+	if (map_inrange(&game->map, here.x, here.y))
+	{
+		if (map_get(&game->map, here.x, here.y) == '1')
+			return (img_getpxlr(&game->textures[TXTBOX],
+					modf(here.x, &a), modf(here.y, &a)));
+	}
+	return (CTRANSPARENT);
+}
+
+void	game_draw_minimap_direction(t_game *game)
+{
+	t_pt		end;
+	int			i;
+	t_hitrec	*hit;
+	t_line		ray;
+
+	i = -1;
+	while (++i < ceil((float)game->disp.width / game->upscale))
+	{
+		hit = &game->hit_buffer[i].hitlist[0];
+		ray = game->hit_buffer[i].ray;
+		end = vec_add(
+				vec_rotate(vec_scale(ray.dir, 1 / MINIMAP_SCALE * hit->dist),
+					game->rot),
+				vec(game->minimap_center.x, game->minimap_center.y)
+				);
+		if (!isfinite(end.x) || !isfinite(end.y))
+			continue ;
+		img_draw_line(&game->disp.buffer, game->minimap_center,
+			ipt(end.x, end.y), CMINIMAPDIR);
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_mouse.c                                       :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 18:22:15 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 18:22:17 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	game_mouse_trap(t_game *game)
+{
+	mlx_mouse_move(game->disp.mlx, game->disp.win, game->disp.width / 2,
+		game->disp.height / 2);
+	mlx_mouse_hide(game->disp.mlx, game->disp.win);
+}
+
+void	game_mouse_release(t_game *game)
+{
+	mlx_mouse_show(game->disp.mlx, game->disp.win);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_object.c                                      :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:52:02 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/09 17:14:49 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/// Add game object `obj` to `game`, in the first
+/// free spot of its game object list
+void	game_obj_add(t_game *game, t_obj *obj)
+{
+	int	i;
+
+	i = -1;
+	while (++i < MAX_OBJECTS)
+	{
+		if (game->objects[i].type == OBJ_NONE)
+		{
+			game->objects[i] = *obj;
+			break ;
+		}
+	}
+}
+
+/// Calculate texture coordinates from world coordinates and wall direction
+t_pt	mapwall_get_coord(int dir, t_pt3 *wcoord)
+{
+	double		i;
+	const float	x = modf(wcoord->x, &i);
+	const float	y = modf(wcoord->y, &i);
+
+	if (dir == DWEST)
+		return (vec(y, 1 - wcoord->z));
+	else if (dir == DEAST)
+		return (vec(1 - y, 1 - wcoord->z));
+	else if (dir == DSOUTH)
+		return (vec(x, 1 - wcoord->z));
+	else if (dir == DNORTH)
+		return (vec(1 - x, 1 - wcoord->z));
+	return (vec(.5, .5));
+}
+
+/// Given a `ray` finds intersections with game object `obj`
+t_hitrec	game_obj_intersect(t_game *game, t_obj *obj, const t_line *ray)
+{
+	t_line		orth;
+	t_hitrec	a;
+
+	if (obj->type == OBJ_NONE)
+		return (hitnone());
+	orth.dir = vec_rotate(vec(1, 0), -game->rot);
+	if (obj->type == OBJ_PLANE || obj->type == OBJ_PILL
+		|| obj->type == OBJ_DOOR)
+		orth.dir = vec_rotate(obj->normal, M_PI / 2);
+	orth.loc = vec_from_vec3(&obj->pos);
+	a = line_inters_line(ray, &orth);
+	if (a.dist > 0 && a.r >= -obj->width / 2 && a.r <= obj->width / 2)
+	{
+		a.obj = obj;
+		return (a);
+	}
+	return (hitnone());
+}
+
+t_color	wall_get_pixel(t_game *game, t_hitrec *hit, float z, int *past)
+{
+	t_color	matcol;
+	int		dir;
+	t_pt3	coord;
+	t_pt	txtpos;
+	t_color	col;
+
+	if (z >= 0 && z <= 1)
+	{
+		dir = vec_direction(&hit->normal);
+		coord = vec3_from_vec(&hit->hit);
+		coord.z = z;
+		txtpos = mapwall_get_coord(vec_direction(&hit->normal), &coord);
+		col = img_getpxlr(&game->textures[dir], txtpos.x, txtpos.y);
+		if (game->matrix_mode_mix > 0.01)
+		{
+			matcol = img_getpxlr(&game->mattex, txtpos.x, txtpos.y);
+			col = col_mix(col, matcol, 1 - (game->matrix_mode_mix
+						* MATMODE_MAXMIX));
+		}
+		return (col);
+	}
+	else if (past)
+		*past = 1 - 2 * (z < 0);
+	return (CTRANSPARENT);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_object_pixel.c                                :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:52:02 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/09 17:12:34 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+t_color	obj_get_pixel_door(t_game *game, t_hitrec *hit, float *z, int *past)
+{
+	t_color	col;
+
+	if (*z < hit->obj->pos.z || *z > hit->obj->pos.z + hit->obj->height)
+		return (CTRANSPARENT);
+	else if (past)
+		*past = 1 - 2 * (*z < hit->obj->pos.z);
+	col = img_getpxlr(&game->textures[TXTDOOR], hit->r / hit->obj->width + .5
+			- hit->obj->u_obj.door.open / 100.0, (1 - ((*z - hit->obj->pos.z)
+					/ hit->obj->height)));
+	return (col);
+}
+
+t_color	obj_get_pixel_agent(t_game *game, t_hitrec *hit, float *z, int *past)
+{
+	t_color	col;
+	t_img	*i;
+
+	col = CTRANSPARENT;
+	if (*z < hit->obj->pos.z && past)
+		*past = -1;
+	else if (past && *z > hit->obj->pos.z + hit->obj->height)
+		*past = 1;
+	else
+	{
+		i = obj_get_agent_texture(game);
+		col = img_getpxlr(i, -hit->r / hit->obj->width + .5, (1 - *z
+					/ hit->obj->height));
+	}
+	return (col);
+}
+
+t_img	*obj_get_agent_texture(t_game *game)
+{
+	const int	d = 15;
+	int			t;
+
+	t = game->ticks;
+	if (game->matrix_mode)
+	{
+		if (t / d % 4 == 0)
+			return (&game->textures[TXTAGENT0]);
+		else if (t / d % 4 == 1)
+			return (&game->textures[TXTAGENT1]);
+		else if (t / d % 4 == 2)
+			return (&game->textures[TXTAGENT2]);
+		else if (t / d % 4 == 3)
+			return (&game->textures[TXTAGENT1]);
+	}
+	return (&game->textures[TXTAGENT1]);
+}
+
+t_color	obj_get_pixel_pill(t_game *game, t_hitrec *hit, float *z)
+{
+	t_color	col;
+
+	if (*z < hit->obj->pos.z || *z > hit->obj->pos.z + hit->obj->height)
+	{
+		return (CTRANSPARENT);
+	}
+	col = img_getpxlr(&game->textures[TXTPILL], hit->r / hit->obj->width + .5,
+			(1 - *z / hit->obj->height));
+	return (col);
+}
+
+t_color	obj_get_pixel_phonebox(t_game *game, t_hitrec *hit, float *z)
+{
+	t_color	col;
+	float	dist;
+
+	if (*z < hit->obj->pos.z || *z > hit->obj->pos.z + hit->obj->height)
+		return (CTRANSPARENT);
+	dist = pt3_dist(&hit->obj->pos, &game->pos);
+	col = img_getpxlr(&game->textures[TXTPHONEBOX0 + (dist < 3)], -hit->r
+			/ hit->obj->width + .5, (1 - *z / hit->obj->height));
+	if ((0xffffff & col) == 0x000000)
+		col = CTRANSPARENT;
+	return (col);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_object_pixel2.c                               :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:52:02 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 12:36:12 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/*
+	`past` will be set to
+	-1 if hit is before object
+	0 if hit
+	1 if hit is after object
+*/
+t_color	obj_get_pixel(t_game *game, t_hitrec *hit, float z, int *past)
+{
+	t_color	col;
+
+	col = CTRANSPARENT;
+	if (hit->obj == GRID_WALL)
+		col = wall_get_pixel(game, hit, z, past);
+	else if (hit->obj->type == OBJ_DOOR)
+		col = obj_get_pixel_door(game, hit, &z, past);
+	else if (hit->obj->type == OBJ_AGENT)
+		col = obj_get_pixel_agent(game, hit, &z, past);
+	else if (hit->obj->type == OBJ_PILL)
+		col = obj_get_pixel_pill(game, hit, &z);
+	else if (hit->obj->type == OBJ_PHONEBOX)
+		col = obj_get_pixel_phonebox(game, hit, &z);
+	else if (hit->obj->type == OBJ_PLANE)
+		col = obj_get_pixel_plane(game, hit, &z, past);
+	else if (hit->obj->type == OBJ_BULLET)
+		col = obj_get_pixel_bullet(game, hit, &z);
+	col = col_fade(col, hit->dist);
+	return (col);
+}
+
+t_color	obj_get_pixel_plane(t_game *game, t_hitrec *hit, float *z, int *past)
+{
+	t_color	col;
+	t_color	matcol;
+
+	if (*z < hit->obj->pos.z || *z > hit->obj->pos.z + hit->obj->height)
+		return (CTRANSPARENT);
+	else if (past)
+		*past = 1 - 2 * (*z < hit->obj->pos.z);
+	col = img_getpxlr(&game->textures[TXTMAX + 1 + hit->obj->texture_id], hit->r
+			/ hit->obj->width + .5, (1 - ((*z - hit->obj->pos.z)
+					/ hit->obj->height)));
+	if (game->matrix_mode_mix > 0.01)
+	{
+		matcol = img_getpxlr(&game->mattex, hit->r / hit->obj->width + .5, (1
+					- ((*z - hit->obj->pos.z) / hit->obj->height)));
+		col = col_mix(col, matcol, 1 - (game->matrix_mode_mix
+					* MATMODE_MAXMIX));
+	}
+	return (col);
+}
+
+t_color	obj_get_pixel_bullet(t_game *game, t_hitrec *hit, float *z)
+{
+	t_color	col;
+
+	if (*z < hit->obj->pos.z - hit->obj->height / 2 || *z > hit->obj->pos.z
+		+ hit->obj->height / 2)
+	{
+		return (CTRANSPARENT);
+	}
+	col = img_getpxlr(&game->textures[TXTBULLET], -hit->r / hit->obj->width
+			+ .5, (1 - (.5 + (*z - hit->obj->pos.z) / hit->obj->height)));
+	return (col);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_ray.c                                         :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:52:08 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/12 16:21:21 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/*
+Finds all hits of the `ray` with world.
+Returns list of hits sorted by distance
+Hits can be both with walls or any other game objects.
+In case of a wall hit, a hitrec's obj will be set to NULL;
+*/
+void	game_get_2d_hits(t_game *game, t_hitrec *hitlist, t_line ray)
+{
+	const t_line	ray_orig = ray;
+	int				i;
+	int				j;
+
+	i = -1;
+	while (1)
+	{
+		hitlist[++i] = map_ray_intersect(&game->map, &ray);
+		hitlist[i].dist = pt_dist(&ray_orig.loc, &hitlist[i].hit);
+		ray.loc = vec_add(hitlist[i].hit, vec_scale(ray.dir, RAY_MARCH_DELTA));
+		if (!(isfinite(hitlist[i].dist) && i < MAXHITS))
+			break ;
+	}
+	j = -1;
+	while (++j < MAX_OBJECTS)
+	{
+		if (game->objects[j].type != OBJ_NONE)
+		{
+			hitlist[i] = game_obj_intersect(game, &game->objects[j], &ray_orig);
+			if (isfinite(hitlist[i].dist))
+				i++;
+		}
+	}
+	hitlist[i] = hitnone();
+	hitlist_sort(hitlist);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_render.c                                      :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:52:12 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 12:00:04 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <pthread.h>
+
+void	*game_render_thread(void *arg)
+{
+	t_threadinfo *const	tinf = arg;
+	int					x;
+
+	while (1)
+	{
+		pthread_mutex_lock(&tinf->game->mutex_render);
+		x = tinf->game->next_col;
+		tinf->game->next_col += tinf->game->upscale;
+		pthread_mutex_unlock(&tinf->game->mutex_render);
+		if (x >= tinf->game->disp.width)
+			break ;
+		game_render_col(tinf->game, x, tinf->game->upscale);
+	}
+	return (NULL);
+}
+
+float	cam_coord_to_z(t_game *game, float dist, float cam_y, float fstop_diag)
+{
+	return ((cam_y + game->cam_height * tan(game->rotx)) / fstop_diag
+		* (fstop_diag + dist) + (CAM_HEIGHT + game->pos.z));
+}
+
+void	game_render_prep_col(t_game *game, int x, int w)
+{
+	int			i;
+	int const	col = x / w;
+
+	ft_bzero(&game->hit_buffer[col].hitlist, sizeof(t_hitrec) * (MAXHITS + 1));
+	i = -1;
+	while (++i < MAXHITS + 1)
+		game->hit_buffer[col].hitlist[i].dist = INFINITY;
+	game->hit_buffer[col].ray = game_ray_cast(game, (float)x
+			/ game->disp.width);
+	game_get_2d_hits(game, game->hit_buffer[col].hitlist,
+		game->hit_buffer[col].ray);
+}
+
+t_color	game_render_pt(t_game *game, int bufpos, t_pt campos, float fstop_diag)
+{
+	float		z;
+	int			i;
+	t_color		col;
+
+	col = CTRANSPARENT;
+	i = 0;
+	while (col == CTRANSPARENT && i < MAXHITS && \
+		isfinite(game->hit_buffer[bufpos].hitlist[i].dist))
+	{
+		z = cam_coord_to_z(game, game->hit_buffer[bufpos].hitlist[i].dist,
+				campos.y, fstop_diag);
+		col = obj_get_pixel(game, &game->hit_buffer[bufpos].hitlist[i], z,
+				NULL);
+		i++;
+	}
+	z = cam_coord_to_z(game, game->hit_buffer[bufpos].hitlist[i].dist, campos.y,
+			fstop_diag);
+	if (game->pos.z + CAM_HEIGHT >= 1 && z < 1)
+		col = col_apply(col, game_render_ceil(game, bufpos,
+					campos, fstop_diag));
+	if (col == CTRANSPARENT)
+		col = game_render_floor_ceil(game, bufpos, z,
+				vec(fstop_diag, campos.y));
+	return (col);
+}
+
+void	game_render_col(t_game *game, int x, int w)
+{
+	t_pt	campos;
+	float	fstop_diag;
+	int		y;
+	t_color	col;
+
+	game_render_prep_col(game, x, w);
+	campos.x = ((float)game->disp.width / 2 - x) / \
+		game->disp.width * game->cam_width;
+	fstop_diag = hypot(game->fstop, campos.x);
+	y = 0;
+	while (y < game->disp.height)
+	{
+		col = CTRANSPARENT;
+		if (game->show_minimap && rect_inside(&game->minimap_rect, vec(x, y)))
+			col = game_render_minimap_pxl(game, x, y);
+		if (col == CTRANSPARENT)
+		{
+			campos.y = ((float)game->disp.height / 2 - y) / game->disp.height \
+				* game->cam_height;
+			col = game_render_pt(game, x / w, campos, fstop_diag);
+		}
+		img_draw_rect(&game->disp.buffer, ipt(x, y),
+			ipt(x + w - 1, y + w - 1), col);
+		y += w;
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_collisions.c                                  :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/09 15:05:29 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/09 15:09:50 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+bool	game_collides(t_game *game, t_vec3 pos)
+{
+	const char	next = map_get(&game->map, pos.x, pos.y);
+
+	if (!(game->pos.z >= 1 || !game->physics || (next != '\0' && next != '1')))
+		return (true);
+	if (pos.x <= 0 || pos.x >= game->map.width || pos.y <= 0
+		|| pos.y >= game->map.height)
+		return (true);
+	return (game_check_object_collisions(game, pos));
+}
+
+bool	game_check_object_collisions(t_game *game, t_vec3 pos)
+{
+	int			i;
+	t_line		ray;
+	t_hitrec	h1;
+
+	i = -1;
+	while (++i < MAX_OBJECTS)
+	{
+		if (game->objects[i].type == OBJ_NONE)
+			continue ;
+		ray.loc = vec_from_vec3(&game->pos);
+		ray.dir = vec(pos.x - game->pos.x, pos.y - game->pos.y);
+		h1 = game_obj_intersect(game, &game->objects[i], &ray);
+		if (isfinite(h1.dist) && h1.dist < hypot(pos.x - game->pos.x, pos.y
+				- game->pos.y))
+		{
+			if (game->objects[i].type == OBJ_DOOR
+				&& game->objects[i].u_obj.door.state == D_OPEN)
+				continue ;
+			if (game->pos.z >= game->objects[i].pos.z + game->objects[i].height
+				|| game->pos.z + CAM_HEIGHT < game->objects[i].pos.z)
+				continue ;
+			return (true);
+		}
+	}
+	return (false);
+}
+
+bool	game_collides_obj(t_game *game, t_obj *obj)
+{
+	const t_pt	pos1 = vec_from_vec3(&obj->pos);
+	const t_pt	pos2 = vec_from_vec3(&game->pos);
+	const float	dist2d = pt_dist(&pos1, &pos2);
+
+	if (obj->type == OBJ_PHONEBOX && dist2d < .25)
+	{
+		if (game->pos.z >= obj->pos.z + obj->height || game->pos.z
+			+ CAM_HEIGHT < obj->pos.z)
+			return (false);
+		return (true);
+	}
+	return (false);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_update_move.c                                 :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/09 15:05:29 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/09 15:13:10 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+/// rotate player by `diff` (counter-clockwise)
+void	game_rot(t_game *game, float diff)
+{
+	game->rot += diff;
+	if (game->rot < 0)
+		game->rot += M_PI * 2;
+	if (game->rot >= 2 * M_PI)
+		game->rot -= M_PI * 2;
+}
+
+// TODO: keep this distance to walls
+/*
+float diag =
+	hypot(hypot(game->cam_width / 2, game->fstop), game->cam_height / 2);
+*/
+void	game_move(t_game *game, t_vec *dir)
+{
+	const t_pt	nxtpos = vec_add(vec(game->pos.x, game->pos.y), *dir);
+	t_pt		tmp;
+
+	tmp = vec(game->pos.x, nxtpos.y);
+	if (!game_collides(game, vec3_from_vec(&tmp)))
+		game->pos.y = nxtpos.y;
+	tmp = vec(nxtpos.x, game->pos.y);
+	if (!game_collides(game, vec3_from_vec(&tmp)))
+		game->pos.x = nxtpos.x;
+}
+
+void	game_update_walk(t_game *game)
+{
+	t_vec		walkdir;
+	const float	m = 0.12;
+
+	walkdir = vec(0, 0);
+	if (game_key_pressed(game, KEY_FORWARD))
+		walkdir = vec_add(walkdir, vec(0, -1));
+	if (game_key_pressed(game, KEY_BACKWARD))
+		walkdir = vec_add(walkdir, vec(0, 1));
+	if (game_key_pressed(game, KEY_SLIDELEFT))
+		walkdir = vec_add(walkdir, vec(-1, 0));
+	if (game_key_pressed(game, KEY_SLIDERIGHT))
+		walkdir = vec_add(walkdir, vec(1, 0));
+	if (vec_nonzero(&walkdir))
+	{
+		walkdir = vec_rotate(vec_scale(vec_normalize(walkdir), m), -game->rot);
+		game_move(game, &walkdir);
+	}
+}
+
+void	game_update_move(t_game *game)
+{
+	game_handle_mouse_input(game);
+	if (game_key_pressed(game, KEY_RIGHT))
+		game_rot(game, -ROT_SPEED);
+	if (game_key_pressed(game, KEY_LEFT))
+		game_rot(game, ROT_SPEED);
+	if (game_key_pressed(game, KEY_UP))
+		game->rotx += ROT_SPEED;
+	if (game_key_pressed(game, KEY_DOWN))
+		game->rotx -= ROT_SPEED;
+	if (!game->physics)
+	{
+		if (game_key_pressed(game, KEY_MOVEUP) || game_key_pressed(game,
+				KEY_MOVEUP2))
+			game->pos.z += SPEED_MOVEVERT;
+		if (game_key_pressed(game, KEY_MOVEDOWN) || game_key_pressed(game,
+				KEY_MOVEDOWN2))
+			game->pos.z -= SPEED_MOVEVERT;
+	}
+}
+
+void	game_handle_mouse_input(t_game *game)
+{
+	int	x;
+	int	y;
+	int	xoffset;
+	int	yoffset;
+
+	mlx_mouse_get_pos(game->disp.mlx, game->disp.win, &x, &y);
+	mlx_mouse_move(game->disp.mlx, game->disp.win, game->disp.width / 2,
+		game->disp.height / 2);
+	xoffset = game->disp.width / 2 - x;
+	yoffset = game->disp.height / 2 - y;
+	game_rot(game, (float)xoffset / game->disp.width * M_PI * MOUSE_SENS_Y);
+	if (ROTX)
+	{
+		game->rotx += (float)yoffset / game->disp.height * M_PI * MOUSE_SENS_X;
+		game->rotx = fclamp(game->rotx, -M_PI / 4, M_PI / 4);
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_update_obj.c                                  :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/09 15:05:29 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/13 14:06:30 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+void	game_update_phonebox(t_game *game, int *i)
+{
+	char	*cpy;
+
+	if (game_collides_obj(game, &game->objects[*i]))
+	{
+		cpy = ft_strdup(game->map.level);
+		map_deinit(&game->map);
+		game_deinit_textures(game);
+		game_init_map(game, cpy);
+		free(cpy);
+	}
+}
+
+void	game_update_pill(t_game *game, t_pt objpos, t_pt pos, int *i)
+{
+	game->objects[*i].normal = vec_rotate(game->objects[*i].normal, .05);
+	objpos = vec_from_vec3(&game->objects[*i].pos);
+	if (pt_dist(&objpos, &pos) < .25)
+	{
+		game->matrix_mode = 1;
+		game->objects[*i].type = OBJ_NONE;
+	}
+}
+
+void	game_update_bullet(t_game *game, int *i)
+{
+	int			j;
+	t_line		ray;
+	t_hitrec	h;
+
+	j = -1;
+	while (++j < MAX_OBJECTS)
+	{
+		if (game->objects[j].type != OBJ_AGENT)
+			continue ;
+		ray.loc = vec_from_vec3(&game->objects[*i].pos);
+		ray.dir = vec_from_vec3(&game->objects[*i].u_obj.bullet.speed);
+		h = game_obj_intersect(game, &game->objects[j], &ray);
+		if (isfinite(h.dist)
+			&& h.dist <= vec_len(vec_from_vec3 \
+				(&game->objects[*i].u_obj.bullet.speed)))
+		{
+			game_obj_takedamage(&game->objects[j], 20);
+			game->objects[*i].type = OBJ_NONE;
+		}
+	}
+	game->objects[*i].pos.x += game->objects[*i].u_obj.bullet.speed.x;
+	game->objects[*i].pos.y += game->objects[*i].u_obj.bullet.speed.y;
+	game->objects[*i].pos.z += game->objects[*i].u_obj.bullet.speed.z;
+}
+
+void	game_update_matrix_agent(t_game *game, t_pt objpos, t_pt pos, int *i)
+{
+	float	d;
+	t_vec	diff;
+
+	d = pt_dist(&objpos, &pos);
+	if (d >= AGENT_ATTACK_RANGE)
+	{
+		diff.x = objpos.x - pos.x;
+		diff.y = objpos.y - pos.y;
+		diff = vec_normalize(diff);
+		game->objects[*i].pos.x += -diff.x * AGENT_SPD;
+		game->objects[*i].pos.y += -diff.y * AGENT_SPD;
+	}
+	else
+	{
+		game->health -= AGENT_ATTACK_DMG;
+		game->damage_taken = 1;
+		if (game->health <= 0)
+			game->state = S_OVER;
+	}
+}
+
+void	game_update_door_object(t_game *game, int *i)
+{
+	t_obj	*o;
+	t_door	*d;
+
+	o = &game->objects[*i];
+	d = &o->u_obj.door;
+	if (d->state == D_OPENING)
+	{
+		d->open += DOOR_OPENSPEED;
+		if (d->open >= DOOR_MAXOPEN)
+			d->state = D_OPEN;
+	}
+	else if (d->state == D_CLOSING)
+	{
+		d->open -= DOOR_CLOSESPEED;
+		if (d->open <= 0)
+			d->state = D_CLOSED;
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   game_update_physics.c                              :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/09 15:05:29 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/09 15:20:46 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+void	game_update_physics(t_game *game)
+{
+	if (game->physics)
+	{
+		game->pos.z += game->mz;
+		game->mz -= PH_GRAVITY;
+		if ((game->pos.z <= 0 && map_get(&game->map, game->pos.x,
+					game->pos.y) == '0') || (game->pos.z <= 1
+				&& map_get(&game->map, game->pos.x, game->pos.y) == '1'))
+		{
+			game->pos.z = (map_get(&game->map, game->pos.x,
+						game->pos.y) == '1');
+			game->mz = 0;
+		}
+	}
+	if (game->health <= HEALTH_REGEN_LIMIT)
+		game->health += HEALTH_REGEN_RATE;
+}
+
+void	game_obj_takedamage(t_obj *o, int dmg)
+{
+	o->u_obj.enemy.hit_points -= dmg;
+	if (o->u_obj.enemy.hit_points <= 0)
+		o->type = OBJ_NONE;
+}
+
+void	game_update_matrix(t_game *game)
+{
+	float	f;
+
+	if (game->matrix_mode_mix > 0 && game->ticks % MATTEX_PERIOD == 0)
+	{
+		mattex_update(&game->mt);
+		mattex_draw(&game->mt, game, &game->mattex);
+	}
+	if (game->physics && game_key_pressed(game, KEY_JUMP)
+		&& game->pos.z <= (map_get(&game->map, game->pos.x,
+				game->pos.y) == '1'))
+	{
+		if (game->matrix_mode)
+			game->mz = PH_JUMP2;
+		else
+			game->mz = PH_JUMP;
+	}
+	f = game->matrix_mode * (1 - game->matrix_mode_mix) + !game->matrix_mode
+		* game->matrix_mode_mix;
+	game->matrix_mode_mix += f * MATMODE_TOGGLE_SPEED * (-1 + 2
+			* game->matrix_mode);
+	game->matrix_mode_mix = fclamp(game->matrix_mode_mix, 0, 1);
+}
+
+void	game_framectrl(t_game *game, struct timeval *now, struct timeval *then)
+{
+	int	diff;
+
+	diff = timediff(now, then);
+	if (diff > (1000 / FRAMERATE) && game->upscale < MAX_UPSCALE)
+	{
+		game->upscale++;
+	}
+	while (diff <= (1000 / MAX_FRAMERATE))
+	{
+		usleep(100);
+		gettimeofday(now, NULL);
+		diff = timediff(now, then);
+	}
+	game->last_draw = *then;
+	game->fps = 1000 / diff;
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   img.c                                              :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:53:23 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 12:58:26 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <mlx.h>
+
+/// Create new image `img` with width `w` and height `h`
+void	img_init(t_img *img, void *mlx, int w, int h)
+{
+	img->mlximg = mlx_new_image(mlx, w, h);
+	if (!img->mlximg)
+		return ;
+	img->width = w;
+	img->height = h;
+	img->data = (unsigned char *) mlx_get_data_addr(img->mlximg,
+			&img->bpp, &img->size_line, &img->endian);
+	img->scale = 1;
+}
+
+/// Create new image `img` by reading and .xpm file from `path`
+bool	img_load(t_img *img, void *mlx, char *path)
+{
+	img->mlximg = mlx_xpm_file_to_image(mlx, path, &img->width, &img->height);
+	if (!img->mlximg)
+		img->mlximg = (unsigned char *) mlx_xpm_file_to_image(mlx,
+				TEX_NOTFOUND, &img->width, &img->height);
+	if (!img->mlximg)
+		return (false);
+	img->data = (unsigned char *) mlx_get_data_addr(img->mlximg,
+			&img->bpp, &img->size_line, &img->endian);
+	img->scale = 1;
+	return (true);
+}
+
+/// Deinit image `img`
+void	img_deinit(t_img *img, void *mlx)
+{
+	if (img && img->mlximg)
+		mlx_destroy_image(mlx, img->mlximg);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   img_draw.c                                         :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 11:48:36 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 11:50:56 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/// draw rectangle from top left to bottom right
+void	img_draw_rect(t_img *img, t_ipt tl, t_ipt br, t_color col)
+{
+	int	x;
+	int	y;
+
+	y = tl.y;
+	while (y <= br.y)
+	{
+		x = tl.x;
+		while (x <= br.x)
+		{
+			img_putpxl(img, x, y, col);
+			x++;
+		}
+		y++;
+	}
+}
+
+/// paint complete image with color `col`
+void	img_clear(t_img *img, t_color col)
+{
+	img_draw_rect(img, ipt(0, 0), ipt(img->width - 1, img->height - 1), col);
+}
+
+static void	img_line_init(struct s_linestate *ls, t_ipt p1, t_ipt p2)
+{
+	ls->dx = abs(p2.x - p1.x);
+	ls->sx = ft_ternary_int(p1.x < p2.x, 1, -1);
+	ls->dy = -abs(p2.y - p1.y);
+	ls->sy = ft_ternary_int(p1.y < p2.y, 1, -1);
+	ls->error = ls->dx + ls->dy;
+	ls->steps = fmax(ls->dx, -ls->dy);
+	ls->i = 0;
+}
+
+void	img_draw_line(t_img *img, t_ipt p1, t_ipt p2, t_color col)
+{
+	struct s_linestate	ls;
+
+	img_line_init(&ls, p1, p2);
+	while (true)
+	{
+		img_putpxl(img, p1.x, p1.y, col);
+		if (p1.x == p2.x && p1.y == p2.y)
+			break ;
+		ls.e2 = 2 * ls.error;
+		if ((ls.e2 >= ls.dy && p1.x == p2.x) || \
+				(ls.e2 <= ls.dx && p1.y == p2.y))
+			break ;
+		if (ls.e2 >= ls.dy)
+		{
+			ls.error += ls.dy;
+			p1.x += ls.sx;
+		}
+		if (ls.e2 <= ls.dx)
+		{
+			ls.error += ls.dx;
+			p1.y += ls.sy;
+		}
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   img_fade.c                                         :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 13:09:57 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 13:29:04 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	img_green_fade(t_img *img)
+{
+	int		y;
+	int		x;
+	t_color	c;
+
+	y = 0;
+	while (y < img->height)
+	{
+		x = 0;
+		while (x < img->width)
+		{
+			c = img_getpxl(img, x, y);
+			if ((c & 0xff0000) >> 4 * 4 > 0x4d)
+				c = CGREEN;
+			c = col_lum(c, MATTEX_FADE);
+			if ((0xff00 & c) <= MATTEX_BACK)
+				c = MATTEX_BACK;
+			img_putpxl(img, x, y, c);
+			x++;
+		}
+		y++;
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   img_put.c                                          :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 11:51:56 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 11:52:22 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	img_put_img_section_stencil(t_img *dst, t_imgsec *src,
+			t_ipt dstpos, t_color col)
+{
+	int			y;
+	int			x;
+	t_color		c;
+	float		f;
+
+	y = 0;
+	while (y < src->sec.br.y - src->sec.tl.y)
+	{
+		x = 0;
+		while (x < src->sec.br.x - src->sec.tl.x)
+		{
+			c = img_getpxl(src->img, x + src->sec.tl.x, y + src->sec.tl.y);
+			f = (0xff & c) / (float) 0xff;
+			if ((c & 0xffffff) != 0)
+				img_putpxl(dst, dstpos.x + x, dstpos.y + y, col_lum(col, f));
+			x++;
+		}
+		y++;
+	}
+}
+
+void	img_put_img(t_img *dst, t_img *src, int putx, int puty)
+{
+	int		y;
+	int		x;
+	t_color	c;
+
+	y = 0;
+	while (y < src->height * src->scale)
+	{
+		x = 0;
+		while (x < src->width * src->scale)
+		{
+			c = img_getpxl(src, x / src->scale, y / src->scale);
+			if ((c & 0xffffff) != 0 && c != 0xffffff)
+				img_putpxl(dst, putx + x, puty + y, c);
+			x++;
+		}
+		y++;
+	}
+}
+
+void	img_put_img_mid(t_img *dst, t_img *src, int putx, int puty)
+{
+	img_put_img(dst, src, putx - src->width / 2, puty - src->height / 2);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   img_pxl.c                                          :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 11:47:43 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 17:17:14 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/// Return data pointer corresponding to pixel at (`x`,`y`)
+unsigned char	*img_getloc(t_img *img, int x, int y)
+{
+	unsigned char	*loc;
+
+	loc = img->data;
+	loc += y * img->size_line;
+	loc += x * (img->bpp / 8);
+	return (loc);
+}
+
+/// Whether pixel at (`x`,`y`) is part of `img`
+bool	img_inrange(t_img *img, int x, int y)
+{
+	return (x >= 0 && x < img->width && y >= 0 && y < img->height);
+}
+
+/// Read single pixel from image `img`
+t_color	img_getpxl(t_img *img, int x, int y)
+{
+	if (!img_inrange(img, x, y))
+		return (CTRANSPARENT);
+	return (*((t_color *) img_getloc(img, x, y)));
+}
+
+/// Read single pixel, using relative coordinates (meaning 0 <= x,y <= 1)
+t_color	img_getpxlr(t_img *img, float x, float y)
+{
+	const int	cx = x * img->width;
+	const int	cy = y * img->height;
+
+	return (img_getpxl(img, cx, cy));
+}
+
+/// Write single pixel from image `img`
+void	img_putpxl(t_img *img, int x, int y, t_color c)
+{
+	if (!img_inrange(img, x, y))
+		return ;
+	*((t_color *) img_getloc(img, x, y)) = c;
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   img_text.c                                         :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 11:50:25 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 15:23:08 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	img_put_char(t_img *img, t_img *font, t_cpt dst, char ch)
+{
+	const char	c = ch - ' ';
+	const int	y = c / 17;
+	const int	x = c % 17;
+	t_imgsec	src;
+
+	src.sec = rect(x * FONT_CHAR_W, y * FONT_CHAR_H,
+			(x + 1) * FONT_CHAR_W, (y + 1) * FONT_CHAR_H);
+	src.img = font;
+	img_put_img_section_stencil(img, &src, dst.pt, dst.col);
+}
+
+void	img_put_text(t_img *img, t_img *font, t_ipt dst, char *t)
+{
+	int	i;
+
+	i = 0;
+	while (t[i])
+	{
+		img_put_char(img, font, cpt(CTEXT, dst.x + i * FONT_CHAR_W, dst.y), \
+				t[i]);
+		i++;
+	}
+}
+
+void	img_put_text_extra(t_img *img, t_img *font, t_ipt dst, t_textinfo *t)
+{
+	t_cpt		c;
+	int			i;
+
+	i = 0;
+	while (t->text[i] && i < t->pos)
+	{
+		c = cpt(t->color, dst.x + i * FONT_CHAR_W, dst.y);
+		img_put_char(img, font, c, t->text[i]);
+		i++;
+	}
+	if (t->carret)
+	{
+		c = cpt(t->color, dst.x + i * FONT_CHAR_W, dst.y);
+		img_put_char(img, font, c, 127);
+	}
+}
+
+void	img_put_text_center(t_img *img, t_img *font, t_ipt dst, char *text)
+{
+	const int	putx = dst.x - ft_strlen(text) * 15 / 2;
+	const int	puty = dst.y - 15;
+
+	img_put_text(img, font, ipt(putx, puty), text);
+}
+
+// void	img_put_textn(t_img *img, t_img *font,
+// 			t_ipt dst, char *text, int n)
+// {
+// 	int		i;
+
+// 	i = 0;
+// 	while (text[i] && n--)
+// 	{
+// 		img_put_char(img, font, ipt(putx + i * FONT_CHAR_W, puty),
+// 			text[i], CGREEN);
+// 		i++;
+// 	}
+// 	img_put_char(img, font, ipt(putx + i * FONT_CHAR_W, puty),
+//		127, CGREEN);//todo: do this properly?
+// }/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map.c                                              :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:02:51 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/13 14:47:38 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/// Initialize `map` by reading file from `path`
+void	map_read(t_map *map, char *path)
+{
+	int		fd;
+	int		in_header;
+	char	*line;
+
+	in_header = 1;
+	fd = -1;
+	if (!ft_endswith(path, MAP_SUFFIX))
+		errexit(ERROR_3);
+	fd = map_open_file(path);
+	line = map_read_header(map, fd, &in_header);
+	map_read_body(map, fd, line);
+	close(fd);
+	map_xy_coordinates(map, path);
+	map_grid_allocation(map, path);
+	map_validation(map);
+}
+
+char	*map_read_header(t_map *map, int fd, int *in_header)
+{
+	char	*line;
+
+	line = get_next_line(fd);
+	if (line && (line[0] == '1' || line[0] == '0'))
+	{
+		free(line);
+		errexit(ERROR_4);
+	}
+	while (line != NULL && *in_header)
+	{
+		if (map_metadata_add(map, line))
+		{
+			free(line);
+			line = get_next_line(fd);
+			continue ;
+		}
+		else
+			*in_header = 0;
+		if (*in_header)
+		{
+			free(line);
+			line = get_next_line(fd);
+		}
+	}
+	return (line);
+}
+
+void	map_read_body(t_map *map, int fd, char *line)
+{
+	int	len;
+	int	end_of_map;
+
+	end_of_map = 0;
+	while (!end_of_map)
+	{
+		if (line == NULL)
+		{
+			end_of_map = 1;
+			break ;
+		}
+		len = (int)ft_strlen(line);
+		if (len > 0 && line[len - 1] == '\n')
+			len--;
+		if (len > 0)
+			map->height++;
+		else
+			end_of_map = 1;
+		if (len > map->width)
+			map->width = len;
+		free(line);
+		line = get_next_line(fd);
+		if (end_of_map && line != NULL)
+			errexit(ERROR_5);
+	}
+}
+
+int	map_last_new_line(char *line)
+{
+	size_t	len;
+
+	len = ft_strlen(line);
+	if (line[len - 1] == '\n')
+	{
+		line[len - 1] = '\0';
+		return (1);
+	}
+	return (0);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_allocation.c                                   :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:01:23 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/13 14:47:36 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	map_grid_allocation(t_map *map, char *path)
+{
+	int		y;
+	int		fd;
+	char	*line;
+
+	map_obj_allocation(map);
+	fd = map_open_file(path);
+	y = 0;
+	line = get_next_line(fd);
+	while (line != NULL && line)
+	{
+		if (map_color_texture_check(line))
+			map_store_textures_and_colors(map, line);
+		else
+			map_process_row(map, line, &y);
+		free(line);
+		line = get_next_line(fd);
+	}
+	map->grid[y] = NULL;
+	close(fd);
+}
+
+void	map_obj_allocation(t_map *map)
+{
+	int	i;
+
+	map->grid = map_calloc(map);
+	map->obj = ft_calloc(map->objcount + 1, sizeof(t_obj));
+	map->intro_phrases = ft_calloc(map->introcount + 1, sizeof(char *));
+	if (!map->intro_phrases)
+	{
+		free(map->obj);
+		exit(EXIT_FAILURE);
+	}
+	map->map_textures = ft_calloc(map->txtcount + 1, sizeof(char *));
+	if (!map->map_textures)
+	{
+		free(map->obj);
+		exit(EXIT_FAILURE);
+	}
+	map->map_textures[map->txtcount] = NULL;
+	i = 0;
+	while (i < map->objcount + 1)
+	{
+		map_init_map_obj(map, i);
+		i++;
+	}
+}
+
+void	map_init_map_obj(t_map *map, int index)
+{
+	map->obj[index].width = -1;
+	map->obj[index].height = -1;
+	map->obj[index].pos.x = -1;
+	map->obj[index].pos.y = -1;
+	map->obj[index].pos.z = -1;
+	map->obj[index].pos.z = -1;
+	map->obj[index].normal.x = -1;
+	map->obj[index].normal.y = -1;
+}
+
+char	**map_calloc(t_map *map)
+{
+	map->grid = (char **)ft_calloc(map->height + 1, sizeof(char *));
+	if (!map->grid)
+		errexit(ERROR_8);
+	return (map->grid);
+}
+
+char	**map_copy_allocation(t_map *map)
+{
+	int		i;
+	char	**copy;
+
+	i = 0;
+	copy = (char **)ft_calloc(map->height + 1, sizeof(char *));
+	if (!copy)
+		errexit(ERROR_8);
+	while (i < map->height)
+	{
+		copy[i] = (char *)ft_strdup(map->grid[i]);
+		if (!copy[i])
+			errexit(ERROR_8);
+		i++;
+	}
+	return (copy);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_checks.c                                       :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:01:39 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/13 14:47:36 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+int	map_metadata_complete(t_map *map)
+{
+	return (map->map_textures[DNORTH] != NULL
+		&& map->map_textures[DSOUTH] != NULL && map->map_textures[DEAST] != NULL
+		&& map->map_textures[DWEST] != NULL && map->floor != CTRANSPARENT
+		&& map->ceiling != CTRANSPARENT);
+}
+
+void	map_validation(t_map *map)
+{
+	char	**map_copy;
+
+	map_copy = map_copy_allocation(map);
+	if (!map_flood_fill(map, map_copy, map->spawn_x, map->spawn_y))
+	{
+		map_free_double_array(map_copy);
+		errexit(ERROR_6);
+	}
+	map_free_double_array(map_copy);
+	if (!map_metadata_complete(map))
+		errexit(ERROR_7);
+}
+
+int	map_flood_fill(t_map *map, char **map_copy, int x, int y)
+{
+	if (x < 0 || y < 0 || y >= map->height || x >= map->width)
+		return (0);
+	if (ft_strchr(CHARS_BLOCKING, map_copy[y][x]) || map_copy[y][x] == 'V')
+		return (1);
+	if (map_copy[y][x] == ' ' || map_copy[y][x] == 0)
+		return (0);
+	if (!ft_strchr(CHARS_WALKABLE, map_copy[y][x]))
+		return (0);
+	map_copy[y][x] = 'V';
+	return (map_flood_fill(map, map_copy, x - 1, y) && map_flood_fill(map,
+			map_copy, x, y - 1) && map_flood_fill(map, map_copy, x + 1, y)
+		&& map_flood_fill(map, map_copy, x, y + 1));
+}
+
+int	map_color_texture_check(char *line)
+{
+	const char	*prefixes[] = {"NO", "SO", "WE", "EA", "F", "C", \
+					"PLN", "TXT", "INTRO", "LVL", "#", "\n", NULL};
+	char		*original_line;
+	int			i;
+
+	original_line = line;
+	while (*line && *line == ' ')
+		line++;
+	if (line != original_line)
+	{
+		ft_memmove(original_line, line, ft_strlen(line));
+		line = original_line;
+	}
+	i = 0;
+	while (prefixes[i] != NULL)
+	{
+		if (ft_strncmp(line, prefixes[i], ft_strlen(prefixes[i])) == 0)
+			return (1);
+		i++;
+	}
+	return (0);
+}
+
+int	map_metadata_add(t_map *map, char *line)
+{
+	const char	*pln = "PLN";
+	const char	*txt = "TXT";
+	const char	*intro = "INTRO";
+	const char	*prefixes[] = {"NO", "SO", "WE", "EA", "F",
+		"C", pln, txt, intro, "LVL", "#", "\n", NULL};
+	int			i;
+
+	map_line_check(line);
+	i = -1;
+	while (prefixes[++i] != NULL)
+	{
+		if (ft_strncmp(line, prefixes[i], ft_strlen(prefixes[i])) == 0)
+		{
+			if (prefixes[i] == txt || ft_strcmp(prefixes[i], "NO") == 0
+				|| ft_strcmp(prefixes[i], "SO") == 0 || ft_strcmp(prefixes[i],
+					"WE") == 0 || ft_strcmp(prefixes[i], "EA") == 0)
+				map->txtcount++;
+			if (prefixes[i] == pln)
+				map->objcount++;
+			if (prefixes[i] == intro)
+				map->introcount++;
+			return (1);
+		}
+	}
+	return (0);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_checks_2.c                                     :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:01:32 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/07 13:01:34 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	map_line_check(char *line)
+{
+	char	*original_line;
+
+	original_line = line;
+	while (*line && *line == ' ')
+		line++;
+	if (line != original_line)
+	{
+		ft_memmove(original_line, line, ft_strlen(line));
+		line = original_line;
+	}
+}
+
+int	map_color_check(char **colors)
+{
+	int	i;
+
+	i = 0;
+	while (colors[i] != NULL)
+	{
+		if (ft_strncmp(colors[i], "-", 1) == 0)
+			return (1);
+		i++;
+	}
+	return (0);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_color.c                                        :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:01:49 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/07 13:01:51 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+int	map_floor_color(t_map *map, char *line)
+{
+	char	*new_string;
+	char	**colors;
+
+	new_string = NULL;
+	colors = NULL;
+	if (ft_strncmp(line, "F", 1) == 0)
+	{
+		new_string = ft_strtrim(line, "F ");
+		colors = ft_split(new_string, ',');
+		free(new_string);
+		(*map).floor_color.red = map_safe_ft_atoi(colors[0]);
+		(*map).floor_color.green = map_safe_ft_atoi(colors[1]);
+		(*map).floor_color.blue = map_safe_ft_atoi(colors[2]);
+		if ((*map).floor_color.red == -1 || (*map).floor_color.green == -1
+			|| (*map).floor_color.blue == -1)
+		{
+			map_free_double_array(colors);
+			exit(EXIT_FAILURE);
+		}
+		map->floor = map_combine_rgb(map->floor_color.red,
+				map->floor_color.green, map->floor_color.blue);
+		map_free_double_array(colors);
+		return (1);
+	}
+	return (0);
+}
+
+int	map_ceiling_color(t_map *map, char *line)
+{
+	char	*new_string;
+	char	**colors;
+
+	new_string = NULL;
+	colors = NULL;
+	if (ft_strncmp(line, "C", 1) == 0)
+	{
+		new_string = ft_strtrim(line, "C ");
+		colors = ft_split(new_string, ',');
+		free(new_string);
+		(*map).ceil_color.red = map_safe_ft_atoi(colors[0]);
+		(*map).ceil_color.green = map_safe_ft_atoi(colors[1]);
+		(*map).ceil_color.blue = map_safe_ft_atoi(colors[2]);
+		if ((*map).ceil_color.red == -1 || (*map).ceil_color.green == -1
+			|| (*map).ceil_color.blue == -1)
+		{
+			map_free_double_array(colors);
+			exit(EXIT_FAILURE);
+		}
+		map->ceiling = map_combine_rgb(map->ceil_color.red,
+				map->ceil_color.green, map->ceil_color.blue);
+		map_free_double_array(colors);
+		return (1);
+	}
+	return (0);
+}
+
+void	map_store_textures_and_colors(t_map *map, char *line)
+{
+	if (map_no_coordinate(map, line))
+		return ;
+	else if (map_so_coordinate(map, line))
+		return ;
+	else if (map_we_coordinate(map, line))
+		return ;
+	else if (map_ea_coordinate(map, line))
+		return ;
+	else if (map_texture(map, line))
+		return ;
+	else if (map_intro(map, line))
+		return ;
+	else if (map_next_lvl(map, line))
+		return ;
+	else if (map_floor_color(map, line) && map_last_new_line(line))
+		return ;
+	else if (map_ceiling_color(map, line) && map_last_new_line(line))
+		return ;
+	else if (map_plane_texture(map, line) && map_last_new_line(line))
+		return ;
+}
+
+int	map_plane_texture(t_map *map, char *line)
+{
+	char	**coordinates;
+	int		j;
+
+	coordinates = NULL;
+	j = map_find_available_object_slot(map);
+	if (j == map->objcount)
+	{
+		return (0);
+	}
+	if (ft_strncmp(line, "PLN", 3) == 0)
+	{
+		coordinates = ft_split(line, ' ');
+		(*map).obj[j].type = OBJ_PLANE;
+		map_parse_plane_details(map, j, coordinates);
+	}
+	map_free_double_array(coordinates);
+	return (0);
+}
+
+unsigned int	map_combine_rgb(unsigned int red,
+		unsigned int green,
+		unsigned int blue)
+{
+	return ((red << 16 | (green << 8) | blue));
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_coordinates.c                                  :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:02:03 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/07 13:02:06 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	map_xy_coordinates(t_map *map, char *path)
+{
+	int		y;
+	int		fd;
+	int		flag;
+	char	*line;
+
+	fd = map_open_file(path);
+	flag = 0;
+	y = 0;
+	line = get_next_line(fd);
+	while (line != NULL)
+	{
+		if (!map_color_texture_check(line))
+		{
+			map_find_direction(map, line, &flag, y);
+			y++;
+		}
+		free(line);
+		line = get_next_line(fd);
+	}
+	close(fd);
+	map_direction_validation(line, flag);
+}
+
+int	map_no_coordinate(t_map *map, char *line)
+{
+	char	*new_string;
+
+	new_string = NULL;
+	if (ft_strncmp(line, "NO ", 3) == 0 && map_last_new_line(line))
+	{
+		new_string = ft_strdup(line + ft_strlen("NO "));
+		map->map_textures[DNORTH] = ft_strdup(new_string);
+		free(new_string);
+		return (1);
+	}
+	return (0);
+}
+
+int	map_so_coordinate(t_map *map, char *line)
+{
+	char	*new_string;
+
+	new_string = NULL;
+	if (ft_strncmp(line, "SO ", 3) == 0 && map_last_new_line(line))
+	{
+		new_string = ft_strdup(line + ft_strlen("SO "));
+		map->map_textures[DSOUTH] = ft_strdup(new_string);
+		free(new_string);
+		return (1);
+	}
+	return (0);
+}
+
+int	map_we_coordinate(t_map *map, char *line)
+{
+	char	*new_string;
+
+	new_string = NULL;
+	if (ft_strncmp(line, "WE ", 3) == 0 && map_last_new_line(line))
+	{
+		new_string = ft_strdup(line + ft_strlen("WE "));
+		map->map_textures[DWEST] = ft_strdup(new_string);
+		free(new_string);
+		return (1);
+	}
+	return (0);
+}
+
+int	map_ea_coordinate(t_map *map, char *line)
+{
+	char	*new_string;
+
+	new_string = NULL;
+	if (ft_strncmp(line, "EA ", 3) == 0 && map_last_new_line(line))
+	{
+		new_string = ft_strdup(line + ft_strlen("EA "));
+		map->map_textures[DEAST] = ft_strdup(new_string);
+		free(new_string);
+	}
+	return (0);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_coordinates_2.c                                :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:01:56 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/13 14:47:37 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+int	map_texture(t_map *map, char *line)
+{
+	char	*new_string;
+
+	new_string = NULL;
+	if (ft_strncmp(line, "TXT ", 4) == 0 && map_last_new_line(line))
+	{
+		new_string = ft_strdup(line + ft_strlen("TXT "));
+		if (map->txt_index < map->txtcount + 1)
+		{
+			map->map_textures[map->txt_index++] = ft_strdup(new_string);
+			free(new_string);
+			return (1);
+		}
+	}
+	return (0);
+}
+
+int	map_intro(t_map *map, char *line)
+{
+	char	*new_string;
+
+	new_string = NULL;
+	if (ft_strncmp(line, "INTRO ", 6) == 0)
+	{
+		new_string = ft_strdup(line + ft_strlen("INTRO "));
+		if (map_last_new_line(new_string))
+			map->intro_phrases[map->intro_index++] = ft_strdup(new_string);
+		free(new_string);
+		return (1);
+	}
+	return (0);
+}
+
+int	map_next_lvl(t_map *map, char *line)
+{
+	char	*new_string;
+
+	new_string = NULL;
+	if (ft_strncmp(line, "LVL ", 3) == 0 && map_last_new_line(line))
+	{
+		map->level = ft_strdup(line + ft_strlen("LVL "));
+		return (1);
+	}
+	return (0);
+}
+
+void	map_find_direction(t_map *map, char *line, int *flag, int y)
+{
+	int	x;
+
+	x = 0;
+	while (line[x])
+	{
+		if (line[x] == 'N' || line[x] == 'S' || line[x] == 'E'
+			|| line[x] == 'W')
+		{
+			(*flag)++;
+			map->direction = line[x];
+			map->spawn_x = x;
+			map->spawn_y = y;
+		}
+		x++;
+	}
+}
+
+void	map_process_row(t_map *map, char *line, int *y)
+{
+	int	i;
+
+	map->grid[*y] = (char *)ft_calloc(map->width + 1, sizeof(char));
+	if (!map->grid[*y])
+		errexit(ERROR_8);
+	map_last_new_line(line);
+	i = 0;
+	while (line[i] != '\0' && i < map->width)
+	{
+		if (line[i] == 'N' || line[i] == 'S' || line[i] == 'E'
+			|| line[i] == 'W')
+			map->grid[*y][i] = '0';
+		else
+			map->grid[*y][i] = line[i];
+		i++;
+	}
+	(*y)++;
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_error_handling.c                               :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:02:11 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/13 14:46:07 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	map_free_double_array(char **map)
+{
+	int	i;
+
+	i = 0;
+	if (map == NULL)
+		return ;
+	while (map[i] != NULL)
+	{
+		free(map[i]);
+		i++;
+	}
+	free(map);
+	map = NULL;
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_ft_atof.c                                      :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:02:19 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/07 13:02:21 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+double	map_ft_atof(const char *str)
+{
+	double	number;
+	double	fraction;
+	int		sign;
+
+	str = map_ft_atof_skip_whitespace(str);
+	sign = map_ft_atof_parse_sign(&str);
+	number = map_ft_atof_integer_part(&str);
+	fraction = map_ft_atof_fractional_part(&str);
+	return ((number + fraction) * sign);
+}
+
+double	map_ft_atof_fractional_part(const char **str)
+{
+	double	fraction;
+	double	place;
+
+	fraction = 0;
+	place = 0.1;
+	if (**str == '.')
+	{
+		(*str)++;
+		while (**str >= '0' && **str <= '9')
+		{
+			fraction += (**str - '0') * place;
+			place *= 0.1;
+			(*str)++;
+		}
+	}
+	return (fraction);
+}
+
+double	map_ft_atof_integer_part(const char **str)
+{
+	double	number;
+
+	number = 0;
+	while (**str >= '0' && **str <= '9')
+	{
+		number = number * 10 + (**str - '0');
+		(*str)++;
+	}
+	return (number);
+}
+
+int	map_ft_atof_parse_sign(const char **str)
+{
+	int	sign;
+
+	sign = 1;
+	if (**str == '-')
+	{
+		sign = -1;
+		(*str)++;
+	}
+	else if (**str == '+')
+	{
+		(*str)++;
+	}
+	return (sign);
+}
+
+const char	*map_ft_atof_skip_whitespace(const char *str)
+{
+	while ((*str >= 9 && *str <= 13) || *str == 32)
+		str++;
+	return (str);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_plane_parsing.c                                :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:02:26 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/07 13:02:28 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+int	map_find_available_object_slot(t_map *map)
+{
+	int	j;
+
+	j = 0;
+	while (j < map->objcount)
+	{
+		if ((*map).obj[j].pos.x == -1 || (*map).obj[j].width == -1
+			|| (*map).obj[j].normal.x == -1)
+			break ;
+		j++;
+	}
+	return (j);
+}
+
+void	map_parse_plane_details(t_map *map, int j, char **coordinates)
+{
+	int	i;
+
+	i = 0;
+	while (coordinates[i] != NULL)
+	{
+		if (ft_strncmp(coordinates[i], "PLN", 3) == 0)
+		{
+			i++;
+			map_parse_plane_coordinates(map, j, coordinates, &i);
+		}
+		else if (map->obj[j].width == -1 && map->obj[j].height == -1)
+			map_parse_plane_w_and_h(map, j, coordinates, &i);
+		else if (map->obj[j].normal.x == -1 && map->obj[j].normal.y == -1)
+			map_parse_normal_vector(map, j, coordinates, &i);
+		else
+			(*map).obj[j].texture_id = map_safe_ft_atoi(coordinates[i]);
+		i++;
+	}
+}
+
+void	map_parse_normal_vector(t_map *map, int j, char **coordinates, int *i)
+{
+	char	**string;
+
+	string = ft_split(coordinates[*i], ',');
+	(*map).obj[j].normal.x = map_ft_atof(string[0]);
+	(*map).obj[j].normal.y = map_ft_atof(string[1]);
+	(*map).obj[j].normal = vec_normalize((*map).obj[j].normal);
+	map_free_double_array(string);
+	string = NULL;
+}
+
+void	map_parse_plane_w_and_h(t_map *map, int j, char **coordinates, int *i)
+{
+	char	**string;
+
+	string = ft_split(coordinates[*i], ',');
+	(*map).obj[j].width = map_ft_atof(string[0]);
+	(*map).obj[j].height = map_ft_atof(string[1]);
+	map_free_double_array(string);
+	string = NULL;
+}
+
+void	map_parse_plane_coordinates(t_map *map, int j, char **coordinates,
+		int *i)
+{
+	char	**string;
+
+	string = ft_split(coordinates[*i], ',');
+	(*map).obj[j].pos.x = map_ft_atof(string[0]);
+	(*map).obj[j].pos.y = map_ft_atof(string[1]);
+	(*map).obj[j].pos.z = map_ft_atof(string[2]);
+	map_free_double_array(string);
+	string = NULL;
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_squares.c                                      :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 12:57:27 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 12:57:31 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+bool	map_inrange(t_map *map, int x, int y)
+{
+	return (!((x < 0 || x >= map->width || y < 0 || y >= map->height)));
+}
+
+char	map_get(t_map *map, int x, int y)
+{
+	if (!map_inrange(map, x, y))
+		return ('\0');
+	return (map->grid[y][x]);
+}
+
+void	map_set(t_map *map, int x, int y, char c)
+{
+	if (!map_inrange(map, x, y))
+		return ;
+	map->grid[y][x] = c;
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_utils.c                                        :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:02:41 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/13 14:47:38 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	map_init_values(t_map *map)
+{
+	ft_bzero(map, sizeof(t_map));
+	map->width = 0;
+	map->height = 0;
+	map->grid = NULL;
+	map->spawn_x = 0;
+	map->spawn_y = 0;
+	map->map_textures = NULL;
+	map->direction = '\0';
+	map->floor = CTRANSPARENT;
+	map->ceiling = CTRANSPARENT;
+	map->ceil_color.red = -1;
+	map->ceil_color.green = -1;
+	map->ceil_color.blue = -1;
+	map->floor_color.red = -1;
+	map->ceil_color.green = -1;
+	map->ceil_color.blue = -1;
+	map->txtcount = 0;
+	map->objcount = 0;
+	map->introcount = 0;
+	map->intro_phrases = NULL;
+	map->txt_index = 4;
+	map->intro_index = 0;
+	map->obj = NULL;
+}
+
+void	map_print(t_map *map)
+{
+	int	y;
+
+	y = 0;
+	while (y < map->height)
+	{
+		printf("%s\n", map->grid[y]);
+		y++;
+	}
+}
+
+void	map_direction_validation(char *line, int flag)
+{
+	if (flag != 1)
+	{
+		free(line);
+		printf("Error\n");
+		exit(EXIT_FAILURE);
+	}
+}
+
+int	map_open_file(char *path)
+{
+	int	fd;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		errexit(ERROR_9);
+	return (fd);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   map_utils_2.c                                      :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 13:02:33 by mcruz-sa          #+#    #+#             */
+/*   Updated: 2024/08/07 19:30:31 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	map_deinit(t_map *map)
+{
+	int	i;
+
+	free(map->obj);
+	map_deinit_doublepointer(map->intro_phrases);
+	map_deinit_doublepointer(map->map_textures);
+	i = 0;
+	if (map->grid == NULL)
+		return ;
+	while (map->grid[i] != NULL)
+	{
+		free(map->grid[i]);
+		i++;
+	}
+	free(map->grid);
+	free(map->level);
+	map->grid = NULL;
+}
+
+void	map_deinit_doublepointer(char **dstr)
+{
+	int	i;
+
+	i = -1;
+	if (dstr == NULL)
+		return ;
+	while (dstr[++i] != NULL)
+		free(dstr[i]);
+	free(dstr);
+	dstr = NULL;
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   utils.c                                            :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/07/11 10:50:52 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 12:57:27 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/// If condition is true, return `true_val`, else return `false_val`
+int	ft_ternary_int(bool condition, int true_val, int false_val)
+{
+	if (condition)
+		return (true_val);
+	return (false_val);
+}
+
+/// If condition is true, return `true_val`, else return `false_val`
+float	ft_ternary_float(bool cond, float true_val, float false_val)
+{
+	if (cond)
+		return (true_val);
+	return (false_val);
+}
+
+int	map_safe_ft_atoi(char *color)
+{
+	if (color == NULL || ft_strcmp(color, "\n") == 0)
+	{
+		ft_putstr_fd("Error: Invalid color input\n", 2);
+		return (-1);
+	}
+	if (ft_strchr(color, '-') != NULL)
+	{
+		ft_putstr_fd("Error: Invalid color input: Negative values\n", 2);
+		return (-1);
+	}
+	return (ft_atoi(color));
+}
+
+int	timediff(struct timeval *t1, struct timeval *t2)
+{
+	int	diff;
+
+	diff = (t1->tv_sec - t2->tv_sec) * 1000;
+	diff += (t1->tv_usec - t2->tv_usec) / 1000;
+	return (diff);
+}
+
+void	*ft_xmalloc(size_t mem)
+{
+	void	*res;
+
+	if (mem == 0)
+		return (NULL);
+	res = ft_calloc(mem, 1);
+	if (!res)
+		errexit("Malloc failed\n");
+	return (res);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   utils_bits.c                                       :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:52:51 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 09:58:12 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+void	set_bit(unsigned char *c, unsigned int i, int val)
+{
+	if (val == 1)
+		*c |= (1 << i);
+	else if (val == 0)
+		*c &= ~(1 << i);
+}
+
+bool	get_bit(unsigned char c, unsigned int i)
+{
+	return (1 & (c >> i));
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   utils_direction.c                                  :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 12:41:14 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 12:41:19 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/// Ensure `angle` lies in between [0,2*M_PI)
+float	angle_normalize(float angle)
+{
+	while (angle < 0)
+		angle += 2 * M_PI;
+	while (angle >= 2 * M_PI)
+		angle -= 2 * M_PI;
+	return (angle);
+}
+
+int	angle_direction(float angle)
+{
+	const float	deg = angle_normalize(angle) / DEG;
+
+	if (fbetw(deg, 0, 45) || fbetw(deg, 315, 360))
+		return (DNORTH);
+	else if (fbetw(deg, 45, 135))
+		return (DWEST);
+	else if (fbetw(deg, 135, 225))
+		return (DSOUTH);
+	else if (fbetw(deg, 225, 315))
+		return (DEAST);
+	return (-1);
+}
+
+float	rot_fromchar(char o)
+{
+	if (o == 'N')
+		return (0);
+	if (o == 'S')
+		return (M_PI);
+	if (o == 'W')
+		return (M_PI / 2);
+	if (o == 'E')
+		return (M_PI / 2 * 3);
+	return (0);
+}
+
+char	*str_direction(int d)
+{
+	if (d == DNORTH)
+		return (ft_strdup("NORTH"));
+	else if (d == DWEST)
+		return (ft_strdup("WEST"));
+	else if (d == DSOUTH)
+		return (ft_strdup("SOUTH"));
+	else if (d == DEAST)
+		return (ft_strdup("EAST"));
+	return (NULL);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   utils_file.c                                       :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 13:30:18 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/12 15:31:27 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#define BUFSIZE	1024
+
+/// Reads through file `path` and returns its length
+int	ft_filelen(char *path)
+{
+	int		fd;
+	char	buffer[BUFSIZE];
+	int		readres;
+	int		len;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return (ERR);
+	len = 0;
+	while (1)
+	{
+		readres = read(fd, buffer, BUFSIZE);
+		if (readres <= 0)
+			break ;
+		len += readres;
+	}
+	close(fd);
+	if (readres < 0)
+		return (ERR);
+	return (len);
+}
+
+/// Return file `path` as string, setting `datalen` to the number of bytes
+/// in the file
+char	*ft_fileload(char *path, int *datalen)
+{
+	const int	len = ft_filelen(path);
+	int			fd;
+	int			readres;
+	int			pos;
+	char		*data;
+
+	data = ft_xmalloc(sizeof(char) * (len + 1));
+	data[len] = '\0';
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return (NULL);
+	if (datalen)
+		*datalen = len;
+	pos = 0;
+	while (1)
+	{
+		readres = read(fd, &data[pos], BUFSIZE);
+		if (readres <= 0)
+			break ;
+		pos += readres;
+	}
+	close(fd);
+	if (readres < 0)
+		return (free(data), NULL);
+	return (data);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   utils_float.c                                      :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:52:55 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 09:52:58 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/// Ensures value `val` is in between `min` and `max`, \returns adjusted value
+float	fclamp(float val, float min, float max)
+{
+	if (val < min)
+		return (min);
+	if (val > max)
+		return (max);
+	return (val);
+}
+
+/// Return `true` if `val` lies in between `min` and `max` (inclusively)
+int	fbetw(float val, float min, float max)
+{
+	return (val >= min && val <= max);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   utils_rect.c                                       :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/13 10:24:17 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 10:31:25 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+bool	rect_inside(t_rect *rect, t_pt pt)
+{
+	return (pt.x >= rect->tl.x && pt.x <= rect->br.x && \
+			pt.y >= rect->tl.y && pt.y <= rect->br.y);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   utils_str.c                                        :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/07 15:31:18 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 15:31:21 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/// Returns `true` if string `s` ends with string `needle`
+bool	ft_endswith(const char *s, const char *needle)
+{
+	const size_t	len = ft_strlen(s);
+	const size_t	nlen = ft_strlen(needle);
+	const char		*cur;
+
+	if (nlen > len)
+		return (false);
+	cur = s + len - nlen;
+	return (ft_strcmp(cur, needle) == 0);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   init.c                                             :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 12:40:49 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 12:55:51 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <vector.h>
+
+/* ===== vec3 ===== */
+t_vec3	vec3(float x, float y, float z)
+{
+	return ((t_vec3){x, y, z});
+}
+
+t_vec3	vec3_from_vec(t_vec	*v)
+{
+	return (vec3(v->x, v->y, 0));
+}
+
+/* ===== ipt ===== */
+t_ipt	ipt(int x, int y)
+{
+	return ((t_ipt){x, y});
+}
+
+/* ===== cpt ===== */
+t_cpt	cpt(t_color c, int x, int y)
+{
+	return ((t_cpt){c, ipt(x, y)});
+}
+
+/* ===== rect ===== */
+t_rect	rect(int x1, int y1, int x2, int y2)
+{
+	return ((t_rect){ipt(x1, y1), ipt(x2, y2)});
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   vector.c                                           :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:53:59 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 12:46:10 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <vector.h>
+#include <math.h>
+#include <stdio.h>
+
+/* ===== vec ===== */
+t_vec	vec(float x, float y)
+{
+	return ((t_vec){x, y});
+}
+
+void	vec_print(t_pt *p)
+{
+	printf("vec: %5.1f %5.1f\n", p->x, p->y);
+}
+
+t_vec	vec_from_vec3(t_vec3 *v)
+{
+	return (vec(v->x, v->y));
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   vector_ops_basic.c                                 :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 12:41:39 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 12:44:58 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <vector.h>
+#include <math.h>
+
+t_vec	vec_add(t_vec a, t_vec b)
+{
+	return (vec(a.x + b.x, a.y + b.y));
+}
+
+t_vec	vec_sub(t_vec a, t_vec b)
+{
+	return (vec(a.x - b.x, a.y - b.y));
+}
+
+t_vec	vec_scale(t_vec a, float f)
+{
+	return ((t_vec){f * a.x, f * a.y});
+}
+
+float	vec_len(t_vec v)
+{
+	return (hypot(v.x, v.y));
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   vector_ops_extra.c                                 :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 12:42:23 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 12:45:13 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <vector.h>
+#include <math.h>
+
+t_vec	vec_normalize(t_vec v)
+{
+	const float	len = vec_len(v);
+
+	return (vec(v.x / len, v.y / len));
+}
+
+t_vec	vec_rotate(t_vec v, float r)
+{
+	t_vec	res;
+
+	res.x = v.x * cos(r) - v.y * sin(r);
+	res.y = v.x * sin(r) + v.y * cos(r);
+	return (res);
+}
+
+int	vec_direction(t_vec *v)
+{
+	if (v->y < 0 && fabs(v->y) >= fabs(v->x))
+		return (DNORTH);
+	else if (v->x < 0 && fabs(v->x) >= fabs(v->y))
+		return (DWEST);
+	else if (v->y > 0 && fabs(v->y) >= fabs(v->x))
+		return (DSOUTH);
+	else if (v->x > 0 && fabs(v->x) >= fabs(v->y))
+		return (DEAST);
+	return (-1);
+}
+
+bool	vec_nonzero(t_vec *v)
+{
+	return (v->x != 0 || v->y != 0);
+}
+
+float	vec_mul(t_vec v, t_vec w)
+{
+	return (v.x * w.x + v.y * w.y);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   color.c                                            :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:46:46 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 14:42:36 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+t_color	col_lum(t_color c, float f)
+{
+	const int	r = f * (0xff & (c >> 16));
+	const int	g = f * (0xff & (c >> 8));
+	const int	b = f * (0xff & c);
+
+	return ((c & 0xff000000) + (r << 16) + (g << 8) + b);
+}
+
+/// Fade `color` to black with increasing distance `dist`
+t_color	col_fade(t_color color, float dist)
+{
+	const float	f = fclamp((25 - (dist - 10)) / 25, .25, 1);
+
+	color = col_lum(color, f);
+	return (color);
+}
+
+t_color	col_mix(t_color a, t_color b, float mix)
+{
+	const t_color	ar = (a & 0xff0000) * mix;
+	const t_color	ag = (a & 0xff00) * mix;
+	const t_color	ab = (a & 0xff) * mix;
+	const t_color	br = (b & 0xff0000) * (1 - mix);
+	const t_color	bg = (b & 0xff00) * (1 - mix);
+
+	return ((ar & 0xff0000) | (ag & 0x00ff00) | (ab & 0x0000ff) | \
+		(br & 0xff0000) | (bg & 0x00ff00) | \
+		((int)((b & 0xff) * (1 - mix)) & 0x0000ff));
+}
+
+t_color	col_apply(t_color col_orig, t_color col_apply)
+{
+	if (col_apply != CTRANSPARENT)
+		return (col_apply);
+	return (col_orig);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   display.c                                          :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:53:15 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 19:53:04 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <mlx.h>
+
+void	display_init(t_display *disp, int w, int h)
+{
+	disp->mlx = mlx_init();
+	disp->win = mlx_new_window(disp->mlx, w, h, DISPLAY_TITLE);
+	disp->width = w;
+	disp->height = h;
+	img_init(&disp->buffer, disp->mlx, disp->width, disp->height);
+}
+
+void	display_deinit(t_display *disp)
+{
+	img_deinit(&disp->buffer, disp->mlx);
+	mlx_destroy_window(disp->mlx, disp->win);
+	mlx_destroy_display(disp->mlx);
+	free(disp->mlx);
+}
+
+void	display_update(t_display *disp)
+{
+	mlx_put_image_to_window(disp->mlx, disp->win, disp->buffer.mlximg, 0, 0);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   hitlist.c                                          :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:53:20 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 12:40:36 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+t_hitrec	hitnone(void)
+{
+	return ((t_hitrec){NULL, INFINITY, INFINITY,
+		vec(INFINITY, INFINITY), vec(0, 0)});
+}
+
+void	hitrec_print(t_hitrec *hr)
+{
+	printf("hitrec: dist=%.2f pos={ %.2f, %.2f }"
+		", normal={ %.2f, %.2f } (%p)\n", \
+		hr->dist, hr->hit.x, hr->hit.y, hr->normal.x, hr->normal.y, hr->obj);
+}
+
+void	hitlist_print(t_hitrec *hr)
+{
+	int	i;
+
+	if (isfinite(hr->dist))
+		printf("=== hitlist ===\n");
+	i = 0;
+	while (i < MAXHITS && isfinite(hr[i].dist))
+	{
+		hitrec_print(&hr[i]);
+		i++;
+	}
+}
+
+void	hitlist_sort(t_hitrec *hitlist)
+{
+	bool			swapped;
+	t_hitrec		h;
+	int				j;
+
+	swapped = true;
+	while (swapped)
+	{
+		swapped = false;
+		j = 0;
+		while (j + 1 < MAXHITS && isfinite(hitlist[j].dist) && \
+				isfinite(hitlist[j + 1].dist))
+		{
+			if (hitlist[j].dist > hitlist[j + 1].dist)
+			{
+				h = hitlist[j];
+				hitlist[j] = hitlist[j + 1];
+				hitlist[j + 1] = h;
+				swapped = true;
+			}
+			j++;
+		}
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   input.c                                            :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:53:27 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/07 18:39:58 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+bool	game_key_pressed(t_game *game, int kc)
+{
+	unsigned int	b;
+	unsigned int	bt;
+
+	b = kc / 8;
+	bt = kc % 8;
+	if (b >= INPUT_STATE_SIZE)
+		return (false);
+	return (get_bit(game->input_state[b], bt));
+}
+
+void	game_set_key(t_game *game, int kc, int state)
+{
+	unsigned int	b;
+	unsigned int	bt;
+
+	b = kc / 8;
+	bt = kc % 8;
+	if (b >= INPUT_STATE_SIZE)
+		return ;
+	set_bit(&game->input_state[b], bt, state);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   main.c                                             :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:46:32 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 15:10:53 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+/* Exits printing `msg` */
+void	errexit(char *msg)
+{
+	ft_putstr_fd(msg, STDERR_FILENO);
+	exit(EXIT_FAILURE);
+}
+
+/* Parse dimension argument */
+int	parse_args_dim(const char *s, t_vec *dim)
+{
+	dim->x = ft_atoi(s);
+	s = ft_strchr(s, 'x');
+	if (!s)
+		return (ERR);
+	dim->y = ft_atoi(s + 1);
+	return (OK);
+}
+
+/* Parse arguments  */
+int	parse_args(int argc, char *argv[], char **map, t_vec *dim)
+{
+	int		i;
+	bool	has_map;
+	bool	has_dim;
+
+	has_map = false;
+	has_dim = false;
+	i = 0;
+	while (++i < argc)
+	{
+		if (ft_endswith(argv[i], MAP_SUFFIX) && !has_map)
+		{
+			*map = argv[i];
+			has_map = true;
+		}
+		else if (ft_strchr(argv[i], 'x') && !has_dim)
+		{
+			if (parse_args_dim(argv[i], dim) != OK)
+				return (ERR);
+			has_dim = true;
+		}
+		else
+			return (ERR);
+	}
+	return (ft_ternary_int(argc < 3 || (has_map && has_dim), OK, ERR));
+}
+
+#ifndef TEST
+
+int	main(int argc, char *argv[])
+{
+	t_game		game;
+	t_vec		dim;
+	char		*map;
+
+	map = MAP_DEFAULT;
+	dim = vec(GAME_W, GAME_H);
+	if (argc != 2 || parse_args(argc, argv, &map, &dim) != OK)
+		errexit("Usage: ./cub3D <mapfile>\n");
+	game_init(&game, map, dim.x, dim.y);
+	game_deinit(&game);
+}
+
+#endif
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   matrix_texture.c                                   :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:53:35 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/12 15:31:32 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <fcntl.h>
+#include <stdlib.h>
+
+int	mattex_init(t_mattex *m)
+{
+	int	i;
+
+	i = 0;
+	while (i < MATTEX_SYMS)
+		m->pts[i++] = (t_pt2){rand() % MATTEX_SIZE, rand() % MATTEX_SIZE};
+	m->data = ft_fileload("assets/src.all", &m->datalen);
+	return (OK);
+}
+
+void	mattex_update(t_mattex *m)
+{
+	int	i;
+
+	i = 0;
+	while (i < MATTEX_SYMS)
+	{
+		m->pts[i].y += MATTEX_FONT_H;
+		if (m->pts[i].y >= MATTEX_SIZE)
+		{
+			m->pts[i].x = rand() % MATTEX_SIZE;
+			m->pts[i].y = -30 - rand() % 30;
+		}
+		i++;
+	}
+}
+
+char	random_char(t_mattex *mt, int col)
+{
+	if (col <= 0)
+		col = -col + 1;
+	col = col % mt->datalen;
+	return (mt->data[col]);
+}
+
+void	mattex_draw(t_mattex *m, t_game *game, t_img *img)
+{
+	t_cpt	cpt;
+	int		i;
+	int		charpick;
+
+	img_green_fade(img);
+	i = 0;
+	while (i < MATTEX_SYMS)
+	{
+		cpt = (t_cpt){MATTEX_WHITE, ipt(m->pts[i].x, m->pts[i].y)};
+		charpick = (int) m->pts[i].x + (int) m->pts[i].y / MATTEX_FONT_H;
+		img_put_char(img, &game->textures[TXTFONT], cpt,
+			random_char(m, charpick));
+		i++;
+	}
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   raycast.c                                          :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:53:41 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/12 16:58:34 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+#include <math.h>
+
+float	pt_dist(const t_pt *p1, const t_pt *p2)
+{
+	const float	xdiff = p1->x - p2->x;
+	const float	ydiff = p1->y - p2->y;
+
+	return (hypot(xdiff, ydiff));
+}
+
+float	pt3_dist(const t_pt3 *p1, const t_pt3 *p2)
+{
+	const float	xdiff = p1->x - p2->x;
+	const float	ydiff = p1->y - p2->y;
+	const float	zdiff = p1->z - p2->z;
+
+	return (sqrt(xdiff * xdiff + ydiff * ydiff + zdiff * zdiff));
+}
+
+t_vec	vec_swap(t_vec v)
+{
+	return (vec(v.y, v.x));
+}
+
+t_hitrec	line_inters_line(const t_line *l1, const t_line *l2)
+{
+	const float	den = l1->dir.x * l2->dir.y - l1->dir.y * l2->dir.x;
+	const float	numt = (l1->loc.x - l2->loc.x) * -l2->dir.y - \
+			(l1->loc.y - l2->loc.y) * -l2->dir.x;
+	const float	numu = l1->dir.y * (l1->loc.x - l2->loc.x) - \
+			l1->dir.x * (l1->loc.y - l2->loc.y);
+	float		t;
+	t_hitrec	r;
+
+	if (den == 0)
+		return (hitnone());
+	t = numt / den;
+	if (t < 0)
+		return (hitnone());
+	r.hit = vec(l1->loc.x + t * l1->dir.x, l1->loc.y + t * l1->dir.y);
+	r.r = numu / den;
+	r.dist = pt_dist(&l1->loc, &r.hit);
+	return (r);
+}
+
+/*
+	Determine collisions of ray with map using ray marching
+
+	ray marching technique:
+
+	1. figure out where ray first hits vertical and horizontal line
+	2. calc. stepx and stepy, the distance traveled to cross one x / one y unit
+	3. keep checking map on shortest path intersections
+*/
+
+// march on until you we hit a wall
+t_hitrec	map_ray_intersect(t_map *map, t_line *l)
+{
+	t_raymarch	rm;
+
+	raymarch_init(&rm, map, l);
+	while (map_inrange(map, rm.pvert.x, rm.pvert.y) || \
+			map_inrange(map, rm.phor.x, rm.phor.y))
+	{
+		if (rm.nxt_dist_vert < rm.nxt_dist_hor)
+		{
+			if (raymarch_horizontal(map, l, &rm))
+				return (rm.hit);
+		}
+		else
+		{
+			if (raymarch_vertical(map, l, &rm))
+				return (rm.hit);
+		}
+	}
+	return (hitnone());
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   raymarch.c                                         :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/12 16:55:56 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/12 16:57:25 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <cub.h>
+
+bool	raymarch_horizontal(t_map *map, t_line *l, t_raymarch *rm)
+{
+	char	from;
+	char	to;
+
+	rm->dx = ft_ternary_int(l->dir.x < 0, -1, 1);
+	from = map_get(map, (int)rm->pvert.x - (l->dir.x < 0) - rm->dx,
+			(int)rm->pvert.y);
+	to = map_get(map, (int)rm->pvert.x - (l->dir.x < 0), (int)rm->pvert.y);
+	if ((from == '1' && to == '0') || (from == '0' && to == '1'))
+	{
+		rm->hit.dist = rm->nxt_dist_vert;
+		rm->hit.normal = vec(-rm->dx, 0);
+		rm->hit.hit = rm->pvert;
+		return (true);
+	}
+	rm->pvert.x += ft_ternary_int(l->dir.x < 0, -1, 1);
+	rm->pvert.y += ft_ternary_float(l->dir.y < 0, -rm->stepy, rm->stepy);
+	rm->nxt_dist_vert += rm->step_vert;
+	return (false);
+}
+
+bool	raymarch_vertical(t_map *map, t_line *l, t_raymarch *rm)
+{
+	char	from;
+	char	to;
+
+	rm->dy = ft_ternary_int(l->dir.y < 0, -1, 1);
+	from = map_get(map, (int)rm->phor.x, (int)rm->phor.y - \
+			(l->dir.y < 0) - rm->dy);
+	to = map_get(map, (int)rm->phor.x, (int)rm->phor.y - (l->dir.y < 0));
+	if ((from == '1' && to == '0') || (from == '0' && to == '1'))
+	{
+		rm->hit.dist = rm->nxt_dist_hor;
+		rm->hit.normal = vec(0, -rm->dy);
+		rm->hit.hit = rm->phor;
+		return (true);
+	}
+	rm->phor.y += ft_ternary_int(l->dir.y < 0, -1, 1);
+	rm->phor.x += ft_ternary_float(l->dir.x < 0, -rm->stepx, rm->stepx);
+	rm->nxt_dist_hor += rm->step_hor;
+	return (false);
+}
+
+void	raymarch_init(t_raymarch *rm, t_map *map, t_line *l)
+{
+	rm->hit.obj = GRID_WALL;
+	rm->hit.dist = -1;
+	rm->hit.hit = vec(INFINITY, INFINITY);
+	rm->hit.normal = vec(0, 0);
+	rm->pvert = map_nxt_vert(map, l);
+	rm->phor = map_nxt_hor(map, l);
+	rm->nxt_dist_vert = pt_dist(&rm->pvert, &l->loc);
+	rm->nxt_dist_hor = pt_dist(&rm->phor, &l->loc);
+	rm->step_vert = fabs(1 / l->dir.x);
+	rm->step_hor = fabs(1 / l->dir.y);
+	rm->stepx = 1 / fabs(l->dir.y) * fabs(l->dir.x);
+	rm->stepy = 1 / fabs(l->dir.x) * fabs(l->dir.y);
+}
+
+/// Find point where line `l` hits vertical line of `map`
+t_pt	map_nxt_vert(t_map *map, t_line *l)
+{
+	t_pt	res;
+	float	distx;
+
+	if (l->dir.x == 0)
+		return ((t_pt){INFINITY, INFINITY});
+	(void)map;
+	res.x = (int)l->loc.x;
+	if (l->dir.x > 0)
+		res.x += 1.0;
+	distx = res.x - l->loc.x;
+	res.y = l->loc.y + l->dir.y / l->dir.x * distx;
+	return (res);
+}
+
+// Find point where line `l` hits horizontal line of map `map`
+t_pt	map_nxt_hor(t_map *map, t_line *l)
+{
+	t_pt	res;
+	float	disty;
+
+	if (l->dir.y == 0)
+		return ((t_pt){INFINITY, INFINITY});
+	(void)map;
+	res.y = (int)l->loc.y;
+	if (l->dir.y > 0)
+		res.y += 1.0;
+	disty = res.y - l->loc.y;
+	res.x = l->loc.x + l->dir.x / l->dir.y * disty;
+	return (res);
+}
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   test.c                                             :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:53:50 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/06 13:34:30 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#include <stdio.h>
+#include <config.h>
+#include <cub.h>
+
+#ifdef TEST
+
+/*
+
+# define T(cond) { int c = (cond); \
+		if (!c) fprintf(stderr, "%s:%i - %s\n", __FILE__, __LINE__, (#cond)); }
+
+int main()
+{
+	// t_vec n = vec(0, -1);
+	// t_vec s = vec(0, 1);
+	// t_vec w = vec(-1, 0);
+	// t_vec e = vec(1, 0);
+
+	// t_line x = (t_line) {vec(0, 0), vec(1, 1)};
+	// t_line a = (t_line) {vec(0, 0), e};
+	// t_line b = (t_line) {vec(0, 0), n};
+	// t_line c = (t_line) {vec(0, 0), n};
+	// t_line d = (t_line) {vec(0, 0), w};
+	// // t_hitrec r = line_inters_line(&b, &a);
+	// t_hitrec r = line_inters_line(&c, &d);
+	// hitrec_print(&r);
+	// unsigned char c;
+	// set_bit(&c, 8, 1);
+	// printf("%i\n", get_bit(c, 7));
+
+	printf("%i\n", ft_filelen("test.txt"));
+	int a;
+	printf("%s\n", ft_fileload("test.txt", &a));
+	printf("%i\n", a);
+}
+
+*/
+
+#endif
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   config.h                                           :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: mcruz-sa <mcruz-sa@student.42.fr>          +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:05:52 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 14:39:35 by mcruz-sa         ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+#ifndef CONFIG_H
+# define CONFIG_H
+
+/// keyboard configuration
+# include <X11/keysym.h>
+# define KEY_FORWARD		XK_w
+# define KEY_BACKWARD		XK_s
+# define KEY_SLIDELEFT		XK_a
+# define KEY_SLIDERIGHT		XK_d
+# define KEY_LEFT			XK_Left
+# define KEY_RIGHT			XK_Right
+# define KEY_UP				XK_Up
+# define KEY_DOWN			XK_Down
+# define KEY_JUMP			XK_space
+# define KEY_MOVEUP			KEY_JUMP
+# define KEY_MOVEDOWN		XK_n
+# define KEY_MOVEUP2		XK_e
+# define KEY_MOVEDOWN2		XK_q
+# define KEY_MINIMAP		XK_m
+# define KEY_DEBUG			XK_k
+# define KEY_MATRIXMODE		XK_0
+# define KEY_PAUSE			XK_p
+# define KEY_EXIT1			XK_Escape
+# define KEY_EXIT2			XK_x
+# define KEY_PHYSICS		XK_c
+# define KEY_INTERACT		XK_f
+
+// ===== gameplay =====
+/// vertical movement speed
+# define SPEED_MOVEVERT		.1
+# define ROT_SPEED			.1
+/// health below which health regen starts
+# define HEALTH_REGEN_LIMIT	50
+/// health regen rate (per tick)
+# define HEALTH_REGEN_RATE	.015
+/// if distance to agent is below this, agent will attack
+# define AGENT_ATTACK_RANGE	.5
+# define AGENT_ATTACK_DMG	.5
+# define AGENT_SPD			.05
+
+// game resolution
+# define GAME_W				2880
+# define GAME_H				1620
+
+# define MINIMAP_TLX		0
+# define MINIMAP_TLY		0
+# define MINIMAP_BRX		500
+# define MINIMAP_BRY		500
+# define MINIMAP_SCALE		.02
+
+// ===== graphics =====
+/// height of perspective (=eye height)
+# define CAM_HEIGHT			.5
+/// camera width
+# define CAM_WIDTH			.0001
+
+# define FRAMERATE			40 // framerate at which upscaling starts
+# define MAX_FRAMERATE		60
+# define MAX_UPSCALE		1
+
+# define MAP_DEFAULT			"lvl/level0.cub"
+# define MAP_SUFFIX			".cub"
+
+# define RAY_MARCH_DELTA	.001
+
+// ===== matrix mode parameters =====
+// matrix mode toggling
+# define MATMODE_TOGGLE_SPEED	.05
+# define MATMODE_MAXMIX			.85
+// matrix texture
+# define MATTEX_SIZE		512
+# define MATTEX_SYMS		35
+# define MATTEX_FADE		.6
+# define MATTEX_PERIOD		6
+# define MATTEX_BACK		0x001000
+# define MATTEX_WHITE		0x909090
+
+# define DISPLAY_TITLE		"cub3D"
+# define TEX_NOTFOUND		"assets/404.xpm"
+
+# define MOUSE_SENS_X		1
+# define MOUSE_SENS_Y		1.5
+
+// rendering options
+# define MAX_OBJECTS		128
+# define MAXHITS			32
+
+# define DOOR_MAXOPEN		90
+# define DOOR_OPENSPEED		6
+# define DOOR_CLOSESPEED	4
+
+// physics and view
+# define PH_GRAVITY			.005
+# define PH_JUMP			.06
+# define PH_JUMP2			.12
+
+# define CTRANSPARENT		0xff000000
+# define CWHITE				0x00ffffff
+# define CBLACK				0x00000000
+# define CGREEN				0x004df84a
+# define CRED				0x00a00000
+# define CBLUE				0x0000a000
+# define CGRAY				0x00d3d3d3
+
+/// default text color
+# define CTEXT				CWHITE
+/// minimap view color
+# define CMINIMAPDIR		CWHITE
+/// intro background color
+# define CINTROBG			0x00101010
+
+# ifndef BONUS
+#  define BONUS				1
+# endif
+
+// MANDATORY configuration
+# if !BONUS
+
+#  define THREADS			0
+#  define ROTX				0
+#  define MATTEX			0
+#  define FLOOR_TEXTURE		0
+/// upscale factor
+#  define GAME_UPSCALE		8
+
+// BONUS configuration
+# else
+
+#  define THREADS			12
+#  define ROTX				1
+#  define MATTEX			0
+#  define FLOOR_TEXTURE		1
+/// upscale factor
+#  define GAME_UPSCALE		2
+
+# endif
+
+#endif
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   cub.h                                              :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/06 09:09:56 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/13 15:18:50 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+/// \file
+#ifndef CUB_H
+# define CUB_H
+
+# include <libft.h>
+# include "vector.h"
+
+# include <X11/X.h>
+# include <X11/keysym.h>
+
+# include <stdbool.h>
+# include <fcntl.h>
+# include <stdlib.h>
+# include <string.h>
+# include <stdio.h>
+# include <sys/time.h>
+
+# include <mlx.h>
+
+# include <assert.h>
+
+# include <math.h>
+
+# include <math.h>
+# include <stdbool.h>
+
+# include "config.h"
+
+# include "error.h"
+
+# define DEG			0.017453292519943295
+# define GRID_WALL		0
+
+# define OK				0
+# define ERR			-1
+
+// textures
+# define TXTNORTH		DNORTH
+# define TXTEAST		DEAST
+# define TXTSOUTH		DSOUTH
+# define TXTWEST		DWEST
+# define TXTAGENT0		4
+# define TXTAGENT1		5
+# define TXTAGENT2		6
+# define TXTPILL		7
+# define TXTDOOR		8
+# define TXTPHONEBOX0	9
+# define TXTPHONEBOX1	10
+# define TXTPOINT		11
+# define TXTGUN			12
+# define TXTBOX			13
+# define TXTFONT		14
+# define TXTBULLET		15
+# define TXTFLOOR		16
+# define TXTMAX			TXTFLOOR
+
+typedef struct s_obj	t_obj;
+
+# define CHARS_WALKABLE	"0NEWSRPDA"
+# define CHARS_BLOCKING	"123456789"
+
+# define FONT_CHAR_W	15
+# define FONT_CHAR_H	30
+# define MATTEX_FONT_H	24
+
+# define INPUT_STATE_SIZE	65535
+
+struct s_linestate
+{
+	int	dx;
+	int	sx;
+	int	dy;
+	int	sy;
+	int	error;
+	int	e2;
+	int	steps;
+	int	i;
+};
+
+typedef struct s_floor
+{
+	int	red;
+	int	green;
+	int	blue;
+}	t_floor;
+
+typedef struct s_ceil
+{
+	int	red;
+	int	green;
+	int	blue;
+}	t_ceil;
+
+typedef struct s_map
+{
+	int		width;
+	int		height;
+	char	**grid;
+	int		spawn_x;
+	int		spawn_y;
+	int		txtcount;
+	int		objcount;
+	int		introcount;
+	char	direction;
+	char	**map_textures;
+	char	**intro_phrases;
+	char	*level;
+	t_obj	*obj;
+	t_floor	floor_color;
+	t_ceil	ceil_color;
+	t_color	floor;
+	t_color	ceiling;
+	int		txt_index;
+	int		intro_index;
+}	t_map;
+
+/// image type containing image metadata as well as the mlx image pointer
+typedef struct s_img
+{
+	// metadata
+	int				width;
+	int				height;
+	// mlx data
+	void			*mlximg;
+	unsigned char	*data;
+	int				bpp;
+	int				size_line;
+	int				endian;
+	float			scale;
+}	t_img;
+
+/// image section (image pointer + rect)
+typedef struct s_imgsec
+{
+	t_img	*img;
+	t_rect	sec;
+}	t_imgsec;
+
+/// game display
+typedef struct s_display
+{
+	void	*mlx;
+	void	*win;
+	int		width;
+	int		height;
+	t_img	buffer;
+}	t_display;
+
+typedef enum e_objtype
+{
+	OBJ_NONE = 0,
+	OBJ_AGENT,
+	OBJ_PILL,
+	OBJ_PHONEBOX,
+	OBJ_PLAYER,
+	OBJ_PLANE,
+	OBJ_BULLET,
+	OBJ_DOOR,
+}	t_objtype;
+
+typedef struct s_bullet
+{
+	t_pt3	speed;
+}	t_bullet;
+
+typedef struct s_enemy
+{
+	unsigned int	hit_points;
+}	t_enemy;
+
+typedef enum e_doorstate
+{
+	D_OPEN,
+	D_OPENING,
+	D_CLOSED,
+	D_CLOSING
+}	t_doorstate;
+
+typedef struct s_door
+{
+	int			open;
+	t_doorstate	state;
+}	t_door;
+
+/// game object: one of several types of game entities
+/// that are rendered separately from the walls
+typedef struct s_obj
+{
+	t_objtype	type;
+	t_pt3		pos;
+	float		width;
+	float		height;
+	float		rot;
+	t_vec		normal;
+	int			texture_id;
+	union
+	{
+		t_bullet	bullet;
+		t_enemy		enemy;
+		t_door		door;
+	}	u_obj;
+}	t_obj;
+
+// hit record struct
+// when we detect a ray hit, the function returns
+// this information
+typedef struct s_hitrec
+{
+	t_obj	*obj;	// obj that was hit - can be WALL (=NULL)
+	float	r;		// position along orthogonal line
+	float	dist;	// map distance (2D) from camera
+	t_pt	hit;	// position where ray hits
+	t_vec	normal;	// normal vector
+}	t_hitrec;
+
+// column data for one rendering single column
+typedef struct s_column_data
+{
+	t_line		ray;
+	t_hitrec	hitlist[MAXHITS + 1];
+}	t_column_data;
+
+/// Animated matrix texture
+typedef struct s_mattex
+{
+	t_pt2	pts[MATTEX_SYMS];
+	char	*data;
+	int		datalen;
+}	t_mattex;
+
+/// Threadinfo type - contains information passed to a render thread
+typedef struct s_tinfo
+{
+	struct s_game	*game;
+	int				thread_id;
+}	t_threadinfo;
+
+typedef struct s_textinfo
+{
+	char	*text;
+	t_color	color;
+	int		pos;
+	bool	carret;
+}	t_textinfo;
+
+typedef struct s_raymarch
+{
+	t_pt		pvert;
+	t_pt		phor;
+	float		nxt_dist_vert;
+	float		nxt_dist_hor;
+	float		step_vert;
+	float		step_hor;
+	float		stepx;
+	float		stepy;
+	int			dx;
+	int			dy;
+	t_hitrec	hit;
+}	t_raymarch;
+
+typedef enum e_gamestate
+{
+	S_OVER = 0,
+	S_INTRO,
+	S_RUNNING,
+	S_PAUSING,
+	S_PAUSED,
+	S_WON,
+}	t_gamestate;
+
+/// game struct, containing complete game state and assets
+typedef struct s_game
+{
+	t_display		disp;
+	// game state
+	t_gamestate		state;
+	unsigned int	ticks;
+	t_vec3			pos;
+	float			mz;
+	float			rot;
+	float			rotx;
+	float			health;
+	bool			damage_taken;
+	// game objects
+	t_obj			objects[MAX_OBJECTS];
+	// input
+	unsigned char	input_state[INPUT_STATE_SIZE];
+	// map
+	t_map			map;
+	//minimap
+	t_rect			minimap_rect;
+	t_ipt			minimap_center;
+	// graphics
+	float			fov;
+	float			fstop;
+	float			cam_width;
+	float			cam_height;
+	int				upscale;
+	struct timeval	last_draw;
+	int				fps;
+	// textures
+	t_img			*textures;
+	// matrix mode
+	int				matrix_mode;
+	float			matrix_mode_mix;
+	t_mattex		mt;
+	t_img			mattex;
+	// toggleables
+	bool			physics;
+	bool			show_minimap;
+	bool			show_debug;
+	// multi-threaded rendering
+	t_column_data	*hit_buffer;
+	pthread_mutex_t	mutex_render;
+	int				next_col;
+	pthread_t		threads[THREADS];
+	t_threadinfo	threadinfos[THREADS];
+	pthread_t		thread_music;
+}	t_game;
+
+/* src/color.c */
+t_color			col_lum(t_color c, float f);
+t_color			col_fade(t_color color, float dist);
+t_color			col_mix(t_color a, t_color b, float mix);
+t_color			col_apply(t_color col_orig, t_color col_apply);
+/* src/display.c */
+void			display_init(t_display *disp, int w, int h);
+void			display_deinit(t_display *disp);
+void			display_update(t_display *disp);
+/* src/hitlist.c */
+t_hitrec		hitnone(void);
+void			hitrec_print(t_hitrec *hr);
+void			hitlist_print(t_hitrec *hr);
+void			hitlist_sort(t_hitrec *hitlist);
+/* src/input.c */
+bool			game_key_pressed(t_game *game, int kc);
+void			game_set_key(t_game *game, int kc, int state);
+/* src/main.c */
+void			errexit(char *msg);
+int				parse_args_dim(const char *s, t_vec *dim);
+int				parse_args(int argc, char *argv[], char **map, t_vec *dim);
+int				main(int argc, char *argv[]);
+/* src/matrix_texture.c */
+int				mattex_init(t_mattex *m);
+void			mattex_update(t_mattex *m);
+char			random_char(t_mattex *mt, int col);
+void			mattex_draw(t_mattex *m, t_game *game, t_img *img);
+/* src/raycast.c */
+float			pt_dist(const t_pt *p1, const t_pt *p2);
+float			pt3_dist(const t_pt3 *p1, const t_pt3 *p2);
+t_vec			vec_swap(t_vec v);
+t_hitrec		line_inters_line(const t_line *l1, const t_line *l2);
+t_pt			map_nxt_vert(t_map *map, t_line *l);
+t_pt			map_nxt_hor(t_map *map, t_line *l);
+t_hitrec		map_ray_intersect(t_map *map, t_line *l);
+/* src/raymarch.c */
+bool			raymarch_horizontal(t_map *map, t_line *l, t_raymarch *rm);
+bool			raymarch_vertical(t_map *map, t_line *l, t_raymarch *rm);
+void			raymarch_init(t_raymarch *rm, t_map *map, t_line *l);
+t_pt			map_nxt_vert(t_map *map, t_line *l);
+t_pt			map_nxt_hor(t_map *map, t_line *l);
+/* src/sound.c */
+void			*sound_play(void *args);
+/* src/test.c */
+/* src/game/game.c */
+void			game_calc_camera_params(t_game *game);
+void			game_rot(t_game *game, float diff);
+bool			game_collides(t_game *game, t_vec3 pos);
+bool			game_check_object_collisions(t_game *game, t_vec3 pos);
+void			game_move(t_game *game, t_vec *dir);
+void			game_obj_takedamage(t_obj *o, int dmg);
+bool			game_collides_obj(t_game *game, t_obj *obj);
+
+void			game_update_objects(t_game *game);
+void			game_update_door_object(t_game *game, int *i);
+void			game_update_matrix_agent(t_game *game, t_pt objpos,
+					t_pt pos, int *i);
+void			game_update_bullet(t_game *game, int *i);
+void			game_update_pill(t_game *game, t_pt objpos, t_pt pos, int *i);
+void			game_update_phonebox(t_game *game, int *i);
+void			game_handle_mouse_input(t_game *game);
+void			game_update_physics(t_game *game);
+void			game_update_walk(t_game *game);
+void			game_update_move(t_game *game);
+void			game_update_matrix(t_game *game);
+void			game_update(t_game *game);
+t_line			game_ray_cast(t_game *game, float f);
+void			game_framectrl(t_game *game, struct timeval *now,
+					struct timeval *then);
+int				game_loop(t_game *game);
+/* src/game/game_actions.c */
+void			game_shoot(t_game *game);
+void			game_setblock(t_game *game);
+void			game_unsetblock(t_game *game);
+void			game_interact(t_game *game);
+void			game_pause_toggle(t_game *game);
+/* src/game/game_init.c */
+void			game_map_add_planes(t_game *game);
+void			game_init_hooks(t_game *game);
+void			game_init_map(t_game *game, char *map_path);
+void			game_txt_load(t_game *game, int txtid, char *path);
+void			game_init(t_game *game, char *map_path, int w, int h);
+/* src/game/game_deinit.c */
+void			game_deinit(t_game *game);
+void			game_deinit_textures(t_game *game);
+int				game_handle_close(void *param);
+void			game_setup_window_close_handler(void *win_ptr);
+/* src/game/game_init_textures.c */
+void			game_obj_new(t_game *game, t_objtype type, t_vec3 *pos);
+void			game_obj_door_init(t_game *game, t_obj *nobj, t_vec3 *pos);
+int				game_init_textures(t_game *game);
+void			game_init_img_textures(t_game *game);
+void			game_map_add_objects(t_game *game);
+/* src/game/game_init_utils.c */
+void			game_obj_print(t_obj *obj);
+void			game_init_logic(t_game *game);
+void			game_init_camera(t_game *game);
+t_objtype		map_char_to_objtype(char objchar);
+void			game_initialize_minimap_variables(t_game *game);
+/* src/game/game_input.c */
+int				game_mousedown(int key, int x, int y, t_game *game);
+void			game_keydown_controls(t_game *game, int key);
+int				game_keydown(int key, t_game *game);
+int				game_keyup(int key, t_game *game);
+/* src/game/game_mouse.c */
+void			game_mouse_trap(t_game *game);
+void			game_mouse_release(t_game *game);
+/* src/game/game_object.c */
+void			game_obj_add(t_game *game, t_obj *obj);
+t_pt			mapwall_get_coord(int dir, t_pt3 *wcoord);
+t_hitrec		game_obj_intersect(t_game *game, t_obj *obj, const t_line *ray);
+t_color			wall_get_pixel(t_game *game, t_hitrec *hit, float z, int *past);
+t_color			obj_get_pixel(t_game *game, t_hitrec *hit, float z, int *past);
+t_color			obj_get_pixel_bullet(t_game *game, t_hitrec *hit, float *z);
+t_color			obj_get_pixel_plane(t_game *game, t_hitrec *hit,
+					float *z, int *past);
+t_color			obj_get_pixel_phonebox(t_game *game, t_hitrec *hit, float *z);
+t_color			obj_get_pixel_pill(t_game *game, t_hitrec *hit, float *z);
+t_color			obj_get_pixel_agent(t_game *game, t_hitrec *hit,
+					float *z, int *past);
+t_color			obj_get_pixel_door(t_game *game, t_hitrec *hit,
+					float *z, int *past);
+t_img			*obj_get_agent_texture(t_game *game);
+/* src/game/game_ray.c */
+void			game_get_2d_hits(t_game *game, t_hitrec *hitlist, t_line ray);
+/* src/game/game_render.c */
+float			cam_coord_to_z(t_game *game,
+					float dist, float cam_y, float fstop_diag);
+void			*game_render_thread(void *arg);
+void			game_render_prep_col(t_game *game, int x, int w);
+t_color			game_render_floor_ceil(t_game *game,
+					int x, float z, t_vec diag_camy);
+t_color			game_render_ceil(t_game *game, int bufpos, t_pt campos,
+					float fstop_diag);
+void			game_render_col(t_game *game, int x, int w);
+t_color			game_render_minimap_pxl(t_game *game, int x, int y);
+void			game_draw_minimap_direction(t_game *game);
+void			game_draw_crosshairs(t_game *game);
+void			game_draw_intro(t_game *game);
+void			game_draw_frame(t_game *game);
+void			game_draw_overlay_txt(t_game *game, char *msg);
+void			game_render_multi(t_game *game);
+void			game_render(t_game *game);
+void			game_draw(t_game *game);
+/* src/game/game_hooks.c */
+void			game_expose(t_game *game);
+/* src/map/map.c */
+void			map_read(t_map *map, char *path);
+char			*map_read_header(t_map *map, int fd, int *in_header);
+void			map_read_body(t_map *map, int fd, char *line);
+int				map_last_new_line(char *line);
+/* src/map/map_squares.c */
+bool			map_inrange(t_map *map, int x, int y);
+char			map_get(t_map *map, int x, int y);
+void			map_set(t_map *map, int x, int y, char c);
+/* src/map/map_allocation.c */
+void			map_grid_allocation(t_map *map, char *path);
+void			map_obj_allocation(t_map *map);
+void			map_init_map_obj(t_map *map, int index);
+char			**map_calloc(t_map *map);
+char			**map_copy_allocation(t_map *map);
+/* src/map/map_checks.c */
+int				map_metadata_complete(t_map *map);
+void			map_validation(t_map *map);
+int				map_flood_fill(t_map *map, char **map_copy, int x, int y);
+int				map_color_texture_check(char *line);
+int				map_metadata_add(t_map *map, char *line);
+/* src/map/map_checks_2.c */
+void			map_line_check(char *line);
+int				map_color_check(char **colors);
+/* src/map/map_color.c */
+int				map_floor_color(t_map *map, char *line);
+int				map_ceiling_color(t_map *map, char *line);
+void			map_store_textures_and_colors(t_map *map, char *line);
+int				map_plane_texture(t_map *map, char *line);
+unsigned int	map_combine_rgb(unsigned int red, unsigned int green,
+					unsigned int blue);
+/* src/map/map_coordinates.c */
+void			map_xy_coordinates(t_map *map, char *path);
+int				map_no_coordinate(t_map *map, char *line);
+int				map_so_coordinate(t_map *map, char *line);
+int				map_we_coordinate(t_map *map, char *line);
+int				map_ea_coordinate(t_map *map, char *line);
+/* src/map/map_coordinates_2.c */
+int				map_texture(t_map *map, char *line);
+int				map_intro(t_map *map, char *line);
+int				map_next_lvl(t_map *map, char *line);
+void			map_find_direction(t_map *map, char *line, int *flag, int y);
+void			map_process_row(t_map *map, char *line, int *y);
+/* src/map/map_error_handling.c */
+void			map_free_double_array(char **map);
+/* src/map/map_ft_atof.c */
+double			map_ft_atof(const char *str);
+double			map_ft_atof_fractional_part(const char **str);
+double			map_ft_atof_integer_part(const char **str);
+int				map_ft_atof_parse_sign(const char **str);
+const char		*map_ft_atof_skip_whitespace(const char *str);
+/* src/map/map_plane_parsing.c */
+int				map_find_available_object_slot(t_map *map);
+void			map_parse_plane_details(t_map *map, int j, char **coordinates);
+void			map_parse_normal_vector(t_map *map, int j,
+					char **coordinates, int *i);
+void			map_parse_plane_w_and_h(t_map *map,
+					int j, char **coordinates, int *i);
+void			map_parse_plane_coordinates(t_map *map,
+					int j, char **coordinates, int *i);
+/* src/map/map_utils.c */
+void			map_init_values(t_map *map);
+void			map_print(t_map *map);
+void			map_direction_validation(char *line, int flag);
+int				map_open_file(char *path);
+/* src/map/map_utils_2.c */
+void			map_deinit(t_map *map);
+void			map_deinit_doublepointer(char **dstr);
+/* src/img/img.c */
+void			img_init(t_img *img, void *mlx, int w, int h);
+bool			img_load(t_img *img, void *mlx, char *path);
+void			img_deinit(t_img *img, void *mlx);
+/* src/img/img_draw.c */
+void			img_draw_rect(t_img *img, t_ipt tl, t_ipt br, t_color col);
+void			img_clear(t_img *img, t_color col);
+void			img_draw_line(t_img *img, t_ipt p1, t_ipt p2, t_color col);
+/* src/img/img_fade.c */
+void			img_green_fade(t_img *img);
+/* src/img/img_put.c */
+void			img_put_img_section_stencil(t_img *dst, t_imgsec *src,
+					t_ipt dstpos, t_color col);
+void			img_put_img(t_img *dst, t_img *src, int putx, int puty);
+void			img_put_img_mid(t_img *dst, t_img *src, int putx, int puty);
+/* src/img/img_pxl.c */
+unsigned char	*img_getloc(t_img *img, int x, int y);
+bool			img_inrange(t_img *img, int x, int y);
+t_color			img_getpxl(t_img *img, int x, int y);
+t_color			img_getpxlr(t_img *img, float x, float y);
+void			img_putpxl(t_img *img, int x, int y, t_color c);
+/* src/img/img_text.c */
+void			img_put_char(t_img *img, t_img *font, t_cpt dst, char ch);
+void			img_put_text(t_img *img, t_img *font, t_ipt dst, char *t);
+void			img_put_text_extra(t_img *img,
+					t_img *font, t_ipt dst, t_textinfo *t);
+void			img_put_text_center(t_img *img,
+					t_img *font, t_ipt dst, char *text);
+/* src/vector/init.c */
+t_vec3			vec3(float x, float y, float z);
+t_vec3			vec3_from_vec(t_vec *v);
+t_ipt			ipt(int x, int y);
+t_cpt			cpt(t_color c, int x, int y);
+t_rect			rect(int x1, int y1, int x2, int y2);
+/* src/vector/vector.c */
+t_vec			vec(float x, float y);
+void			vec_print(t_pt *p);
+t_vec			vec_from_vec3(t_vec3 *v);
+/* src/vector/vector_ops_basic.c */
+t_vec			vec_add(t_vec a, t_vec b);
+t_vec			vec_sub(t_vec a, t_vec b);
+t_vec			vec_scale(t_vec a, float f);
+float			vec_len(t_vec v);
+/* src/vector/vector_ops_extra.c */
+t_vec			vec_normalize(t_vec v);
+t_vec			vec_rotate(t_vec v, float r);
+int				vec_direction(t_vec *v);
+bool			vec_nonzero(t_vec *v);
+float			vec_mul(t_vec v, t_vec w);
+/* src/utils/utils.c */
+int				ft_ternary_int(bool condition, int true_val, int false_val);
+float			ft_ternary_float(bool cond, float true_val, float false_val);
+int				map_safe_ft_atoi(char *color);
+int				timediff(struct timeval *t1, struct timeval *t2);
+bool			ft_endswith(const char *s, const char *needle);
+void			*ft_xmalloc(size_t mem);
+t_hitrec		hitnone(void);
+/* src/utils/utils_direction.c */
+float			angle_normalize(float angle);
+int				angle_direction(float angle);
+float			rot_fromchar(char o);
+char			*str_direction(int d);
+/* src/utils/utils_bits.c */
+void			set_bit(unsigned char *c, unsigned int i, int val);
+bool			get_bit(unsigned char c, unsigned int i);
+/* src/utils/utils_file.c */
+int				ft_filelen(char *path);
+char			*ft_fileload(char *path, int *datalen);
+/* src/utils/utils_float.c */
+float			fclamp(float val, float min, float max);
+int				fbetw(float val, float min, float max);
+/* src/utils/utils_rect.c */
+bool			rect_inside(t_rect *rect, t_pt pt);
+
+#endif/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   error.h                                            :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/12 16:59:25 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/12 16:59:26 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+/// \file
+#ifndef ERROR_H
+# define ERROR_H
+
+# define ERROR_1 "Memory allocation failed"
+# define ERROR_2 "Error: Map does not exits"
+# define ERROR_3 "Error: File type is wrong. Please check\n"
+# define ERROR_4 "Error: File cannot start with map.\n"
+# define ERROR_5 "Error: Map must be at the last position of the file\n"
+# define ERROR_6 "Error. Map is not surrounded by walls\n"
+# define ERROR_7 "Error: File not correct\n"
+# define ERROR_8 "Error: Failed allocation\n"
+# define ERROR_9 "Error: Map does not exists\n"
+
+#endif
+/* ************************************************************************** */
+/*                                                                            */
+/*                                                        :::      ::::::::   */
+/*   vector.h                                           :+:      :+:    :+:   */
+/*                                                    +:+ +:+         +:+     */
+/*   By: triedel <triedel@student.42.fr>            +#+  +:+       +#+        */
+/*                                                +#+#+#+#+#+   +#+           */
+/*   Created: 2024/08/12 16:59:36 by triedel           #+#    #+#             */
+/*   Updated: 2024/08/12 17:00:56 by triedel          ###   ########.fr       */
+/*                                                                            */
+/* ************************************************************************** */
+
+/// \file
+#ifndef VECTOR_H
+# define VECTOR_H
+
+# include <stdbool.h>
+
+/// 2D vector
+typedef struct s_vec2
+{
+	float	x;
+	float	y;
+}	t_vec2;
+
+/// 3D vector
+typedef struct s_vec3
+{
+	float	x;
+	float	y;
+	float	z;
+}	t_vec3;
+
+/// 2D vector
+typedef t_vec2			t_vec;
+/// 2D point (equivalent to vector)
+typedef t_vec2			t_pt;
+
+typedef t_vec2			t_pt2;
+typedef t_vec3			t_pt3;
+
+typedef unsigned int	t_color;
+
+/// 2D line, starting at location `loc` with direction vector `dir`
+typedef struct s_line
+{
+	t_pt	loc;
+	t_vec	dir;
+}	t_line;
+
+/// 2D integer point
+typedef struct s_ipt
+{
+	int		x;
+	int		y;
+}	t_ipt;
+
+/// colored point, combines t_color and t_ipt
+typedef struct s_cpt
+{
+	t_color	col;
+	t_ipt	pt;
+}	t_cpt;
+
+typedef struct s_rect
+{
+	// top left
+	t_ipt	tl;
+	// bottom right
+	t_ipt	br;
+}	t_rect;
+
+/// direction constant for north
+# define DNORTH	0
+/// direction constant for south
+# define DSOUTH	1
+/// direction constant for west
+# define DWEST	2
+/// direction constant for east
+# define DEAST	3
+
+// ===== 2D vector =====
+/// create vector - convenience function
+t_vec	vec(float x, float y);
+/// create vector from first 2 entries of a 3D vector
+t_vec	vec_from_vec3(t_vec3 *v);
+/// sum together vectors `a` and `b`
+t_vec	vec_add(t_vec a, t_vec b);
+/// subtract vector `b` from vector`a`
+t_vec	vec_sub(t_vec a, t_vec b);
+/// scale vector `a` by scalar `f`
+t_vec	vec_scale(t_vec a, float f);
+/// rotate vector `v` by `r` radians
+t_vec	vec_rotate(t_vec v, float r);
+/// magnitude of vector
+float	vec_len(t_vec v);
+/// normalize vector, such that its magnitude is 1
+t_vec	vec_normalize(t_vec v);
+/// calculate direction relative to north
+int		vec_direction(t_vec *v);
+/// whether either coordinate is non-zero
+bool	vec_nonzero(t_vec *v);
+/// dot product
+float	vec_mul(t_vec v, t_vec w);
+
+// ===== 3D vector =====
+/// create 3D vector - convenience function
+t_vec3	vec3(float x, float y, float z);
+/// create 3D vector, using x and y from 2D vector `v`
+t_vec3	vec3_from_vec(t_vec	*v);
+
+// ===== ipt / integer point =====
+/// create integer point - convenience function
+t_ipt	ipt(int x, int y);
+// ===== cpt / colored integer point =====
+t_cpt	cpt(t_color c, int x, int y);
+
+// ===== rect =====
+t_rect	rect(int x1, int y1, int x2, int y2);
+
+#endif

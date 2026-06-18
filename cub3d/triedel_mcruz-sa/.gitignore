@@ -1,0 +1,19 @@
+# other files
+*.o
+*.a
+*.xpm
+map_test.cub
+eval_check.txt
+
+# subfolders
+lib/
+doc/
+.obj/
+.vscode/
+maps2/
+tools/
+maps/
+
+# binary
+cub3D
+cub3D_bonus

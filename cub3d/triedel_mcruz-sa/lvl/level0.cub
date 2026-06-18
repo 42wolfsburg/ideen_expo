@@ -1,0 +1,42 @@
+INTRO Wake up Neo ...
+INTRO The Matrix has you ...
+INTRO Follow the white rabbit ...
+
+NO textures/color_stone.xpm
+SO textures/color_stone.xpm
+EA textures/color_stone.xpm
+WE textures/color_stone.xpm
+
+TXT assets/sign.xpm
+PLN 1.05,3.5,0 1,0 1,0.0001 0
+
+TXT textures/red_brick.xpm
+PLN 1.5,2.5,0 1.414,1 1,1 1
+PLN 1.5,4.5,0 1.414,1 1,-1 1
+PLN 4.5,2.5,0 1.414,1 -1,1 1
+PLN 4.5,4.5,0 1.414,1 -1,-1 1
+PLN 6.5,2.5,0 1.414,1 1,1 1
+PLN 6.5,4.5,0 1.414,1 1,-1 1
+
+PLN 14.5,1.5,0 1.414,1 1,1 1
+PLN 14.5,5.5,0 1.414,1 1,-1 1
+PLN 18.5,1.5,0 1.414,1 -1,1 1
+PLN 18.5,5.5,0 1.414,1 -1,-1 1
+
+TXT assets/rabbit.xpm
+PLN 4.49,2.51,0.1 0.1,0 -1,1 2
+PLN 18.99,4.5,0.1 0.1,0 -1,0 2
+
+F 0,0,0
+C 200,200,200
+
+# Level
+LVL lvl/level1.cub
+
+11111111111111111111
+11111111111111000001
+10000100000000000001
+1E000D000111100000P1
+10000100000000000001
+11111111111111000001
+11111111111111111111

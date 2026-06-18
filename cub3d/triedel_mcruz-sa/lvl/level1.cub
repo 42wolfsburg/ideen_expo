@@ -1,0 +1,21 @@
+INTRO You are the one, Neo
+INTRO Beware of agents
+
+NO assets/ship.xpm
+SO assets/ship.xpm
+EA assets/ship.xpm
+WE assets/ship.xpm
+
+F 0,0,0
+C 200,200,200
+
+# Level 2
+LVL lvl/level2.cub
+
+1111111111111111111
+10000D10001000000P1
+10000110A0111111111
+1E000D1000100000001
+1000011000111111111
+10000D00R0100000001
+1111111111111111111
